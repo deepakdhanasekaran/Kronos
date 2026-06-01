@@ -1,0 +1,84 @@
+(.venv) deepakdhanasekaran ~/repos/private/Kronos [master] $ python crypto_predictor.py \
+  --symbol BTCUSDT \
+  --interval 5m \
+  --lookback 256 \
+  --pred-len 1 \
+  --neutral-threshold-pct 0.05 \
+  --confidence-samples 5 \
+  --model-size base
+Symbol: BTCUSDT
+Interval: 5m
+Predicted close: 71648.9922
+Last close: 71715.9900
+Live price: 71715.9900
+Signal: DOWN
+Action: SELL
+Verdict: Strong SELL
+Direction vs last close: DOWN
+Direction vs live: DOWN
+Close change pct: -0.09%
+Live change pct: -0.09%
+Agreement: 0.80
+Trade confidence: 0.80
+Confidence samples: 5
+Signal counts: UP=0 DOWN=4 NEUTRAL=1
+
+Prediction head:
+                                   open          high      low         close     volume      amount
+2026-06-01 17:55:00+00:00  71668.609375  71720.140625  71584.5  71648.992188  52.717567  3825553.75
+(.venv) deepakdhanasekaran ~/repos/private/Kronos [master] $ python crypto_predictor.py \
+  --symbol BTCUSDT \
+  --interval 5m \
+  --lookback 256 \
+  --pred-len 1 \
+  --neutral-threshold-pct 0.05 \
+  --confidence-samples 5 \
+  --model-size base
+Symbol: BTCUSDT
+Interval: 5m
+Predicted close: 71609.7031
+Last close: 71680.0000
+Live price: 71680.0000
+Signal: DOWN
+Action: SELL
+Verdict: SELL
+Direction vs last close: DOWN
+Direction vs live: DOWN
+Close change pct: -0.10%
+Live change pct: -0.10%
+Agreement: 0.60
+Trade confidence: 0.00
+Confidence samples: 5
+Signal counts: UP=0 DOWN=2 NEUTRAL=3
+
+Prediction head:
+                                   open          high          low         close     volume     amount
+2026-06-01 18:05:00+00:00  71666.203125  71698.921875  71571.71875  71609.703125  73.470917  5258130.5
+(.venv) deepakdhanasekaran ~/repos/private/Kronos [master] $ python crypto_predictor.py \
+  --symbol BTCUSDT \
+  --interval 5m \
+  --lookback 256 \
+  --pred-len 1 \
+  --neutral-threshold-pct 0.05 \
+  --confidence-samples 10 \
+  --model-size base
+Symbol: BTCUSDT
+Interval: 5m
+Predicted close: 71475.3203
+Last close: 71477.4600
+Live price: 71477.4600
+Signal: NEUTRAL
+Action: NO_TRADE
+Verdict: NO_TRADE
+Direction vs last close: DOWN
+Direction vs live: DOWN
+Close change pct: -0.00%
+Live change pct: -0.00%
+Agreement: 0.70
+Trade confidence: 0.00
+Confidence samples: 10
+Signal counts: UP=2 DOWN=1 NEUTRAL=7
+
+Prediction head:
+                                 open          high           low         close    volume      amount
+2026-06-01 18:20:00+00:00  71501.4375  71540.835938  71438.867188  71475.320312  41.77734  2978243.75
