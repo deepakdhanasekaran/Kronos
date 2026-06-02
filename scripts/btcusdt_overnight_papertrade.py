@@ -15,10 +15,13 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from crypto_predictor import (
+    DEFAULT_MODEL_NAME,
+    DEFAULT_TOKENIZER_NAME,
     evaluate_binance_prediction,
     fetch_binance_klines,
     interval_to_timedelta,
     predict_binance_direction,
+    MODEL_NAME_BY_SIZE,
 )
 
 
@@ -51,6 +54,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-count", type=int, default=5, help="Stochastic sampling count.")
     parser.add_argument("--neutral-threshold-pct", type=float, default=0.2, help="Neutral threshold percent.")
     parser.add_argument("--confidence-samples", type=int, default=5, help="Confidence sample count.")
+    parser.add_argument(
+        "--tokenizer-name",
+        type=str,
+        default=DEFAULT_TOKENIZER_NAME,
+        help="Hugging Face tokenizer id or local path.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=DEFAULT_MODEL_NAME,
+        help="Hugging Face model id or local path.",
+    )
+    parser.add_argument(
+        "--model-size",
+        type=str,
+        choices=sorted(MODEL_NAME_BY_SIZE.keys()),
+        default="small",
+        help="Shortcut for Kronos model size; overrides --model-name when set.",
+    )
+    parser.add_argument(
+        "--max-context",
+        type=int,
+        default=512,
+        help="Maximum context length for the model.",
+    )
     parser.add_argument("--buffer-seconds", type=int, default=8, help="Extra delay after candle close.")
     parser.add_argument("--max-cycles", type=int, default=0, help="Stop after N cycles. 0 means run until Ctrl-C.")
     parser.add_argument(
@@ -107,6 +135,7 @@ def log_line(message: str) -> None:
 
 def main() -> int:
     args = build_parser().parse_args()
+    model_name = MODEL_NAME_BY_SIZE.get(args.model_size, args.model_name) if args.model_size else args.model_name
     log_path = Path(args.log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -140,6 +169,9 @@ def main() -> int:
                 sample_count=args.sample_count,
                 neutral_threshold_pct=args.neutral_threshold_pct,
                 confidence_samples=args.confidence_samples,
+                tokenizer_name=args.tokenizer_name,
+                model_name=model_name,
+                max_context=args.max_context,
             )
             summary = result["summary"]
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import argparse
 import json
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -26,6 +29,8 @@ BINANCE_TICKER_PRICE_BASE = "https://api.binance.com/api/v3/ticker/price"
 POLYMARKET_EVENT_BASE = "https://gamma-api.polymarket.com/events/slug"
 POLYMARKET_MARKET_BASE = "https://gamma-api.polymarket.com/markets/slug"
 POLYMARKET_EVENTS_LIST_BASE = "https://gamma-api.polymarket.com/events"
+LIVE_SERVER_DEFAULT_HOST = "127.0.0.1"
+LIVE_SERVER_DEFAULT_PORT = 8765
 
 DEFAULT_TOKENIZER_NAME = "NeoQuasar/Kronos-Tokenizer-base"
 DEFAULT_MODEL_NAME = "NeoQuasar/Kronos-small"
@@ -37,6 +42,17 @@ MODEL_NAME_BY_SIZE = {
 
 def fetch_json(url: str, headers: Optional[dict[str, str]] = None) -> Any:
     request = Request(url, headers={**DEFAULT_HTTP_HEADERS, **(headers or {})})
+    with urlopen(request, timeout=30) as response:
+        return response.read().decode("utf-8")
+
+
+def fetch_json_post(url: str, payload: dict[str, Any], headers: Optional[dict[str, str]] = None) -> Any:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={**DEFAULT_HTTP_HEADERS, "Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
     with urlopen(request, timeout=30) as response:
         return response.read().decode("utf-8")
 
@@ -560,6 +576,218 @@ def load_pretrained_predictor(
     return KronosPredictor(model, tokenizer, device=device, max_context=max_context)
 
 
+async def load_pretrained_predictor_async(
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+    model_name: str = DEFAULT_MODEL_NAME,
+    device: Optional[str] = None,
+    max_context: int = 512,
+):
+    return await asyncio.to_thread(
+        load_pretrained_predictor,
+        tokenizer_name=tokenizer_name,
+        model_name=model_name,
+        device=device,
+        max_context=max_context,
+    )
+
+
+async def fetch_binance_klines_async(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    return await asyncio.to_thread(fetch_binance_klines, symbol, interval, limit)
+
+
+async def fetch_binance_spot_price_async(symbol: str) -> float:
+    return await asyncio.to_thread(fetch_binance_spot_price, symbol)
+
+
+class LivePredictionService:
+    def __init__(
+        self,
+        tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+        model_name: str = DEFAULT_MODEL_NAME,
+        device: Optional[str] = None,
+        max_context: int = 512,
+    ) -> None:
+        self.predictor = load_pretrained_predictor(
+            tokenizer_name=tokenizer_name,
+            model_name=model_name,
+            device=device,
+            max_context=max_context,
+        )
+        self.model_name = model_name
+        self.tokenizer_name = tokenizer_name
+        self.device = device
+        self.max_context = max_context
+        self._lock = threading.Lock()
+
+    def predict(self, **kwargs: Any) -> dict[str, Any]:
+        with self._lock:
+            result = asyncio.run(
+                predict_binance_direction_with_predictor_async(
+                    predictor=self.predictor,
+                    **kwargs,
+                )
+            )
+
+        prediction = result["prediction"].copy()
+        summary = dict(result["summary"])
+        samples = [dict(sample) for sample in result["samples"]]
+        return {
+            "prediction": prediction.to_dict(orient="records"),
+            "summary": summary,
+            "samples": samples,
+            "model_info": {
+                "model_name": self.model_name,
+                "tokenizer_name": self.tokenizer_name,
+                "device": self.device,
+                "max_context": self.max_context,
+            },
+        }
+
+
+class LivePredictionRequestHandler(BaseHTTPRequestHandler):
+    server_version = "KronosLive/1.0"
+
+    def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self) -> dict[str, Any]:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        if not raw_body:
+            return {}
+        try:
+            data = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON body: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object.")
+        return data
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path.rstrip("/") == "/health":
+            service: LivePredictionService = self.server.live_service  # type: ignore[attr-defined]
+            self._write_json(
+                200,
+                {
+                    "ok": True,
+                    "model_loaded": True,
+                    "model_info": {
+                        "model_name": service.model_name,
+                        "tokenizer_name": service.tokenizer_name,
+                        "device": service.device,
+                        "max_context": service.max_context,
+                    },
+                },
+            )
+            return
+
+        self._write_json(404, {"error": "Not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path.rstrip("/") != "/predict":
+            self._write_json(404, {"error": "Not found"})
+            return
+
+        try:
+            payload = self._read_json_body()
+            service: LivePredictionService = self.server.live_service  # type: ignore[attr-defined]
+            result = service.predict(
+                symbol=str(payload.get("symbol", "BTCUSDT")),
+                interval=str(payload.get("interval", "5m")),
+                lookback=int(payload.get("lookback", 256)),
+                pred_len=int(payload.get("pred_len", 1)),
+                sample_count=int(payload.get("sample_count", 5)),
+                top_k=int(payload.get("top_k", 0)),
+                top_p=float(payload.get("top_p", 0.9)),
+                temperature=float(payload.get("temperature", 1.0)),
+                neutral_threshold_pct=float(payload.get("neutral_threshold_pct", 0.2)),
+                confidence_samples=int(payload.get("confidence_samples", 5)),
+            )
+            self._write_json(200, {"success": True, **result})
+        except Exception as exc:
+            self._write_json(500, {"error": str(exc)})
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+        return
+
+
+def run_live_prediction_server(
+    host: str = LIVE_SERVER_DEFAULT_HOST,
+    port: int = LIVE_SERVER_DEFAULT_PORT,
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+    model_name: str = DEFAULT_MODEL_NAME,
+    device: Optional[str] = None,
+    max_context: int = 512,
+) -> None:
+    service = LivePredictionService(
+        tokenizer_name=tokenizer_name,
+        model_name=model_name,
+        device=device,
+        max_context=max_context,
+    )
+    httpd = ThreadingHTTPServer((host, port), LivePredictionRequestHandler)
+    httpd.live_service = service  # type: ignore[attr-defined]
+    print(
+        f"Kronos live server running on http://{host}:{port} "
+        f"({model_name}, tokenizer={tokenizer_name})",
+        flush=True,
+    )
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
+def request_live_prediction(live_url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    url = live_url.rstrip("/") + "/predict"
+    response = fetch_json_post(url, payload)
+    data = json.loads(response)
+    if not isinstance(data, dict):
+        raise ValueError(f"Unexpected live prediction response: {data}")
+    if data.get("success") is not True:
+        raise ValueError(data.get("error") or "Live prediction failed.")
+    return data
+
+
+def predict_binance_direction_from_live_server(
+    live_url: str,
+    symbol: str,
+    interval: str,
+    lookback: int,
+    pred_len: int = 1,
+    sample_count: int = 5,
+    top_k: int = 0,
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+    neutral_threshold_pct: float = 0.2,
+    confidence_samples: int = 5,
+) -> dict[str, Any]:
+    payload = {
+        "symbol": symbol,
+        "interval": interval,
+        "lookback": lookback,
+        "pred_len": pred_len,
+        "sample_count": sample_count,
+        "top_k": top_k,
+        "top_p": top_p,
+        "temperature": temperature,
+        "neutral_threshold_pct": neutral_threshold_pct,
+        "confidence_samples": confidence_samples,
+    }
+    data = request_live_prediction(live_url, payload)
+    prediction = pd.DataFrame(data.get("prediction", []))
+    summary = dict(data.get("summary", {}))
+    samples = list(data.get("samples", []))
+    return {"prediction": prediction, "summary": summary, "samples": samples, "model_info": data.get("model_info", {})}
+
+
 def fetch_polymarket_event_by_slug(slug: str) -> dict[str, Any]:
     payload = fetch_json(f"{POLYMARKET_EVENT_BASE}/{slug}")
     data = json.loads(payload)
@@ -601,6 +829,35 @@ def predict_direction_from_prediction_frame(pred_df: pd.DataFrame, context_df: p
     predicted_close = float(pred_df["close"].iloc[-1])
     last_close = float(context_df["close"].iloc[-1])
     return compute_direction_summary(predicted_close, last_close, live_price)
+
+
+def build_sample_summary(
+    predictor: Any,
+    context: pd.DataFrame,
+    x_timestamp: pd.Series,
+    y_timestamp: pd.Series,
+    pred_len: int,
+    top_k: int,
+    top_p: float,
+    temperature: float,
+    live_price: float,
+    neutral_threshold_pct: float,
+) -> dict[str, Any]:
+    sampled_pred_df = predictor.predict(
+        df=context[["open", "high", "low", "close", "volume", "amount"]],
+        x_timestamp=x_timestamp,
+        y_timestamp=y_timestamp,
+        pred_len=pred_len,
+        T=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        sample_count=1,
+        verbose=False,
+    )
+    sample_summary = predict_direction_from_prediction_frame(sampled_pred_df, context, live_price)
+    sample_summary["signal"] = signal_from_change_pct(sample_summary["close_change_pct"], neutral_threshold_pct)
+    sample_summary["action"] = action_from_signal(sample_summary["signal"])
+    return sample_summary
 
 
 def polymarket_direction_summary(outcomes: list[str], outcome_prices: list[float]) -> dict[str, Any]:
@@ -789,26 +1046,106 @@ def predict_binance_direction_with_predictor(
 
     sample_summaries = [summary]
     if confidence_samples > 1:
-        sample_summaries = []
-        for _ in range(confidence_samples):
-            sampled_pred_df = predictor.predict(
-                df=context[["open", "high", "low", "close", "volume", "amount"]],
-                x_timestamp=x_timestamp,
-                y_timestamp=y_timestamp,
-                pred_len=pred_len,
-                T=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                sample_count=1,
-                verbose=False,
-            )
-            sample_summary = predict_direction_from_prediction_frame(sampled_pred_df, context, live_price)
-            sample_summary["signal"] = signal_from_change_pct(
-                sample_summary["close_change_pct"],
+        sample_summaries = [
+            build_sample_summary(
+                predictor,
+                context,
+                x_timestamp,
+                y_timestamp,
+                pred_len,
+                top_k,
+                top_p,
+                temperature,
+                live_price,
                 neutral_threshold_pct,
             )
-            sample_summary["action"] = action_from_signal(sample_summary["signal"])
-            sample_summaries.append(sample_summary)
+            for _ in range(confidence_samples)
+        ]
+
+    direction_score = score_sampled_directions([item["signal"] for item in sample_summaries])
+    summary["confidence"] = direction_score["confidence"]
+    summary["trade_confidence"] = direction_score["trade_confidence"]
+    summary["confidence_samples"] = direction_score["sample_count"]
+    summary["dominant_signal"] = direction_score["dominant_signal"]
+    summary["signal_counts"] = direction_score["counts"]
+    summary["neutral_threshold_pct"] = neutral_threshold_pct
+    summary["verdict"] = verdict_from_summary(summary)
+
+    return {"prediction": pred_df, "summary": summary, "samples": sample_summaries}
+
+
+async def predict_binance_direction_with_predictor_async(
+    predictor: Any,
+    symbol: str,
+    interval: str,
+    lookback: int,
+    pred_len: int = 1,
+    sample_count: int = 5,
+    top_k: int = 0,
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+    neutral_threshold_pct: float = 0.2,
+    confidence_samples: int = 5,
+    history: Optional[pd.DataFrame] = None,
+    live_price: Optional[float] = None,
+):
+    if history is None and live_price is None:
+        history, live_price = await asyncio.gather(
+            fetch_binance_klines_async(symbol, interval, max(lookback + pred_len, lookback)),
+            fetch_binance_spot_price_async(symbol),
+        )
+    else:
+        if history is None:
+            history = await fetch_binance_klines_async(symbol, interval, max(lookback + pred_len, lookback))
+        if live_price is None:
+            live_price = await fetch_binance_spot_price_async(symbol)
+
+    if len(history) < lookback + pred_len:
+        raise ValueError(
+            f"Not enough Binance history for {symbol} @ {interval}: "
+            f"need at least {lookback + pred_len} rows, got {len(history)}"
+        )
+
+    context = history.tail(lookback).reset_index(drop=True)
+    x_timestamp = context["timestamps"]
+    y_timestamp = build_future_timestamps(context["timestamps"].iloc[-1], interval, pred_len)
+
+    pred_df = predictor.predict(
+        df=context[["open", "high", "low", "close", "volume", "amount"]],
+        x_timestamp=x_timestamp,
+        y_timestamp=y_timestamp,
+        pred_len=pred_len,
+        T=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        sample_count=sample_count,
+        verbose=False,
+    )
+
+    summary = predict_direction_from_prediction_frame(pred_df, context, live_price)
+    summary["signal"] = signal_from_change_pct(summary["close_change_pct"], neutral_threshold_pct)
+    summary["action"] = action_from_signal(summary["signal"])
+
+    sample_summaries = [summary]
+    if confidence_samples > 1:
+        sample_summaries = await asyncio.gather(
+            *[
+                asyncio.to_thread(
+                    build_sample_summary,
+                    predictor,
+                    context,
+                    x_timestamp,
+                    y_timestamp,
+                    pred_len,
+                    top_k,
+                    top_p,
+                    temperature,
+                    live_price,
+                    neutral_threshold_pct,
+                )
+                for _ in range(confidence_samples)
+            ]
+        )
 
     direction_score = score_sampled_directions([item["signal"] for item in sample_summaries])
     summary["confidence"] = direction_score["confidence"]
@@ -838,13 +1175,57 @@ def predict_binance_direction(
     model_name: str = DEFAULT_MODEL_NAME,
     max_context: int = 512,
 ):
-    predictor = load_pretrained_predictor(
-        tokenizer_name=tokenizer_name,
-        model_name=model_name,
-        device=device,
-        max_context=max_context,
+    return asyncio.run(
+        predict_binance_direction_async(
+            symbol=symbol,
+            interval=interval,
+            lookback=lookback,
+            pred_len=pred_len,
+            sample_count=sample_count,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            neutral_threshold_pct=neutral_threshold_pct,
+            confidence_samples=confidence_samples,
+            device=device,
+            tokenizer_name=tokenizer_name,
+            model_name=model_name,
+            max_context=max_context,
+        )
     )
-    return predict_binance_direction_with_predictor(
+
+
+async def predict_binance_direction_async(
+    symbol: str,
+    interval: str,
+    lookback: int,
+    pred_len: int = 1,
+    sample_count: int = 5,
+    top_k: int = 0,
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+    neutral_threshold_pct: float = 0.2,
+    confidence_samples: int = 5,
+    device: Optional[str] = None,
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+    model_name: str = DEFAULT_MODEL_NAME,
+    max_context: int = 512,
+):
+    predictor_task = asyncio.create_task(
+        load_pretrained_predictor_async(
+            tokenizer_name=tokenizer_name,
+            model_name=model_name,
+            device=device,
+            max_context=max_context,
+        )
+    )
+    history_task = asyncio.create_task(
+        fetch_binance_klines_async(symbol, interval, max(lookback + pred_len, lookback))
+    )
+    live_price_task = asyncio.create_task(fetch_binance_spot_price_async(symbol))
+
+    predictor, history, live_price = await asyncio.gather(predictor_task, history_task, live_price_task)
+    return await predict_binance_direction_with_predictor_async(
         predictor=predictor,
         symbol=symbol,
         interval=interval,
@@ -856,6 +1237,8 @@ def predict_binance_direction(
         temperature=temperature,
         neutral_threshold_pct=neutral_threshold_pct,
         confidence_samples=confidence_samples,
+        history=history,
+        live_price=live_price,
     )
 
 
@@ -1136,6 +1519,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum context length for the model",
     )
     parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run a warm local prediction server instead of a one-shot prediction.",
+    )
+    parser.add_argument(
+        "--live-url",
+        type=str,
+        default=None,
+        help="Use a running live prediction server at this base URL instead of loading the model locally.",
+    )
+    parser.add_argument("--host", type=str, default=LIVE_SERVER_DEFAULT_HOST, help="Host for --serve mode.")
+    parser.add_argument("--port", type=int, default=LIVE_SERVER_DEFAULT_PORT, help="Port for --serve mode.")
+    parser.add_argument(
         "--polymarket-slug",
         type=str,
         default=None,
@@ -1165,6 +1561,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     model_name = MODEL_NAME_BY_SIZE.get(args.model_size, args.model_name) if args.model_size else args.model_name
 
+    if args.serve:
+        run_live_prediction_server(
+            host=args.host,
+            port=args.port,
+            tokenizer_name=args.tokenizer_name,
+            model_name=model_name,
+            device=args.device,
+            max_context=args.max_context,
+        )
+        return 0
+
     polymarket_slug = resolve_current_polymarket_slug() if args.current else args.polymarket_slug
 
     if args.polymarket_only:
@@ -1184,22 +1591,37 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 0
 
-    result = predict_binance_direction(
-        symbol=args.symbol,
-        interval=args.interval,
-        lookback=args.lookback,
-        pred_len=args.pred_len,
-        sample_count=args.sample_count,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        temperature=args.temperature,
-        neutral_threshold_pct=args.neutral_threshold_pct,
-        confidence_samples=args.confidence_samples,
-        device=args.device,
-        tokenizer_name=args.tokenizer_name,
-        model_name=model_name,
-        max_context=args.max_context,
-    )
+    if args.live_url:
+        result = predict_binance_direction_from_live_server(
+            live_url=args.live_url,
+            symbol=args.symbol,
+            interval=args.interval,
+            lookback=args.lookback,
+            pred_len=args.pred_len,
+            sample_count=args.sample_count,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            neutral_threshold_pct=args.neutral_threshold_pct,
+            confidence_samples=args.confidence_samples,
+        )
+    else:
+        result = predict_binance_direction(
+            symbol=args.symbol,
+            interval=args.interval,
+            lookback=args.lookback,
+            pred_len=args.pred_len,
+            sample_count=args.sample_count,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            neutral_threshold_pct=args.neutral_threshold_pct,
+            confidence_samples=args.confidence_samples,
+            device=args.device,
+            tokenizer_name=args.tokenizer_name,
+            model_name=model_name,
+            max_context=args.max_context,
+        )
 
     polymarket = (
         compare_with_polymarket(
