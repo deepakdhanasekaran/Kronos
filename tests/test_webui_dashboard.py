@@ -3,8 +3,11 @@ from __future__ import annotations
 from webui.app import create_app
 
 
-def make_backend_stub():
+def make_backend_stub(calls=None):
+    calls = [] if calls is None else calls
+
     def fake_backend_request_json(backend_url, path, *, method="GET", payload=None, timeout=300):
+        calls.append({"backend_url": backend_url, "path": path, "method": method, "payload": payload})
         if path.startswith("/health"):
             return {"ok": True, "model_loaded": True}
         if path.startswith("/top-symbols"):
@@ -41,6 +44,7 @@ def make_backend_stub():
 
 
 def test_dashboard_merges_top_symbols_with_persisted_custom_symbols(monkeypatch, tmp_path):
+    calls = []
     app = create_app(
         {
             "BACKEND_URL": "http://backend",
@@ -49,7 +53,7 @@ def test_dashboard_merges_top_symbols_with_persisted_custom_symbols(monkeypatch,
             "DASHBOARD_BACKGROUND_REFRESH": False,
         }
     )
-    monkeypatch.setattr("webui.app._backend_request_json", make_backend_stub())
+    monkeypatch.setattr("webui.app._backend_request_json", make_backend_stub(calls))
     app.extensions["watchlist_store"].save(["XRPUSDT"])
 
     client = app.test_client()
@@ -61,6 +65,8 @@ def test_dashboard_merges_top_symbols_with_persisted_custom_symbols(monkeypatch,
     assert payload["symbols"] == ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
     assert len(payload["items"]) == 3
     assert payload["items"][2]["source"] == "Custom"
+    assert any(call["path"] == "/predict/batch" for call in calls)
+    assert not any(call["path"] == "/predict" for call in calls)
 
 
 def test_dashboard_placeholder_response_includes_safe_timestamp(monkeypatch, tmp_path):
@@ -82,6 +88,30 @@ def test_dashboard_placeholder_response_includes_safe_timestamp(monkeypatch, tmp
     assert payload["refreshing"] is True
     assert "generated_at" in payload
     assert payload["generated_at"]
+
+
+def test_dashboard_manager_refreshes_in_batch(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr("webui.app._backend_request_json", make_backend_stub(calls))
+
+    app = create_app(
+        {
+            "BACKEND_URL": "http://backend",
+            "WATCHLIST_PATH": str(tmp_path / "custom_coins.json"),
+            "DASHBOARD_BACKGROUND_REFRESH": True,
+            "DASHBOARD_REFRESH_SECONDS": 3600,
+        }
+    )
+
+    client = app.test_client()
+    response = client.get("/api/dashboard")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert len(payload["items"]) == 2
+    assert any(call["path"] == "/predict/batch" for call in calls)
+    assert not any(call["path"] == "/predict" for call in calls)
 
 
 def test_dashboard_respects_selected_top_symbols(monkeypatch, tmp_path):

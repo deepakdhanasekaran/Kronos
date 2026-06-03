@@ -118,6 +118,71 @@ Environment variables you can override:
 
 Custom coins are persisted in the mounted watchlist volume, so they survive container restarts.
 
+### ✅ Local Validation
+
+Use these commands to verify the fast dashboard path and the backend contract locally:
+
+```bash
+# Run the tests that cover the dashboard, backend prediction flow, and shared helpers
+.venv/bin/python -m pytest tests/test_dashboard_support.py tests/test_webui_dashboard.py tests/test_crypto_predictor.py -q
+```
+
+```bash
+# Run all project tests under tests/
+.venv/bin/python -m pytest tests -q
+```
+
+```bash
+# Syntax-check the changed dashboard files without running the app
+PYTHONPYCACHEPREFIX=/private/tmp .venv/bin/python -B -m py_compile webui/app.py tests/test_webui_dashboard.py
+```
+
+```bash
+# Start the dashboard locally without Docker
+.venv/bin/python webui/app.py
+```
+
+If you run the repository-wide `pytest -q`, note that it also collects `finetune/qlib_test.py`, which requires the optional `qlib` dependency. If you do not have that installed, prefer `pytest tests -q` instead.
+
+### 🐳 Docker Deploy
+
+Use these commands to deploy and verify the full stack with Docker Compose:
+
+```bash
+# Build and start both services in the foreground
+docker compose up --build
+```
+
+```bash
+# Build and start both services in the background
+docker compose up --build -d
+```
+
+```bash
+# Check service status
+docker compose ps
+```
+
+```bash
+# Tail backend and dashboard logs
+docker compose logs -f predictor dashboard
+```
+
+```bash
+# Check the backend health endpoint
+curl http://localhost:8765/health
+```
+
+```bash
+# Open the dashboard in your browser
+open http://localhost:7070
+```
+
+```bash
+# Stop and remove the stack
+docker compose down
+```
+
 ### 🧪 Paper Trading Bot
 
 If you want to simulate Binance-like spot orders without risking real funds, run the paper trading bot against the warm backend:
@@ -129,10 +194,61 @@ python scripts/binance_paper_trade_bot.py \
   --interval 15m \
   --pred-len 1 \
   --neutral-threshold-pct 0.05 \
-  --confidence-samples 5
+  --confidence-samples 5 \
+  --max-trade-usdt 50 \
+  --take-profit-pct 0.5 \
+  --stop-loss-pct 0.25 \
+  --exit-on-opposite-signal
 ```
 
-The bot keeps a separate paper session per symbol, applies spot-style buy/sell fills with fees and slippage, and refreshes BTC and ETH concurrently so one symbol does not wait on the other.
+The bot keeps a separate paper session per symbol, applies spot-style buy/sell fills with fees and slippage, caps each entry at 50 USDT by default, and can auto-close positions on profit target, stop loss, or an opposite signal so realized PnL is visible before you risk real capital.
+
+For a quick smoke test that is easier to read in the terminal, use:
+
+```bash
+python scripts/binance_paper_trade_bot.py \
+  --live-url http://127.0.0.1:8765 \
+  --symbols BTCUSDT,ETHUSDT \
+  --interval 15m \
+  --pred-len 1 \
+  --neutral-threshold-pct 0.05 \
+  --confidence-samples 5 \
+  --max-trade-usdt 50 \
+  --take-profit-pct 0.5 \
+  --stop-loss-pct 0.25 \
+  --max-cycles 2 \
+  --poll-seconds 2
+```
+
+If you have a Binance **spot demo** account and want to place demo orders instead of using the local simulator, set the demo credentials first:
+
+```bash
+export BINANCE_EXECUTION_MODE=demo
+export BINANCE_DEMO_API_KEY="your_demo_api_key"
+export BINANCE_DEMO_SECRET_KEY="your_demo_secret_key"
+```
+
+Then run the bot with the demo spot base URL:
+
+```bash
+python scripts/binance_paper_trade_bot.py \
+  --execution-mode demo \
+  --binance-base-url https://demo-api.binance.com \
+  --live-url http://127.0.0.1:8765 \
+  --symbols BTCUSDT,ETHUSDT \
+  --interval 15m \
+  --pred-len 1 \
+  --neutral-threshold-pct 0.05 \
+  --confidence-samples 5 \
+  --max-trade-usdt 50 \
+  --take-profit-pct 0.5 \
+  --stop-loss-pct 0.25 \
+  --exit-on-opposite-signal \
+  --max-cycles 2 \
+  --poll-seconds 2
+```
+
+Demo mode uses Binance spot demo trading on `https://demo-api.binance.com` and still uses Kronos for the signal source.
 
 ### 📈 Making Forecasts
 
