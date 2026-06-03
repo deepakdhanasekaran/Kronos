@@ -15,6 +15,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from dashboard_support import (
+    DEFAULT_TOP_SYMBOL_LIMIT,
+    dashboard_row_from_summary,
+    select_top_usdt_symbols,
+)
+
 DEFAULT_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -26,6 +32,7 @@ DEFAULT_HTTP_HEADERS = {
 
 BINANCE_KLINES_BASE = "https://api.binance.com/api/v3/klines"
 BINANCE_TICKER_PRICE_BASE = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_TICKER_24H_BASE = "https://api.binance.com/api/v3/ticker/24hr"
 POLYMARKET_EVENT_BASE = "https://gamma-api.polymarket.com/events/slug"
 POLYMARKET_MARKET_BASE = "https://gamma-api.polymarket.com/markets/slug"
 POLYMARKET_EVENTS_LIST_BASE = "https://gamma-api.polymarket.com/events"
@@ -563,6 +570,22 @@ def fetch_binance_spot_price(symbol: str) -> float:
     return float(price)
 
 
+def fetch_binance_24h_tickers() -> list[dict[str, Any]]:
+    payload = fetch_json(BINANCE_TICKER_24H_BASE)
+    data = json.loads(payload)
+    if not isinstance(data, list):
+        raise ValueError(f"Unexpected Binance 24h ticker response: {data}")
+    tickers: list[dict[str, Any]] = []
+    for entry in data:
+        if isinstance(entry, dict):
+            tickers.append(entry)
+    return tickers
+
+
+def fetch_binance_top_usdt_symbols(limit: int = DEFAULT_TOP_SYMBOL_LIMIT) -> list[dict[str, Any]]:
+    return select_top_usdt_symbols(fetch_binance_24h_tickers(), limit=limit)
+
+
 def load_pretrained_predictor(
     tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
     model_name: str = DEFAULT_MODEL_NAME,
@@ -606,6 +629,8 @@ class LivePredictionService:
         model_name: str = DEFAULT_MODEL_NAME,
         device: Optional[str] = None,
         max_context: int = 512,
+        cache_ttl_seconds: int = 30,
+        max_concurrent_predictions: int = 2,
     ) -> None:
         self.predictor = load_pretrained_predictor(
             tokenizer_name=tokenizer_name,
@@ -617,10 +642,37 @@ class LivePredictionService:
         self.tokenizer_name = tokenizer_name
         self.device = device
         self.max_context = max_context
-        self._lock = threading.Lock()
+        self.cache_ttl_seconds = max(0, int(cache_ttl_seconds))
+        self.max_concurrent_predictions = max(1, int(max_concurrent_predictions))
+        self._predict_gate = threading.Semaphore(self.max_concurrent_predictions)
+        self._cache_lock = threading.Lock()
+        self._batch_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+
+    def _model_info(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "tokenizer_name": self.tokenizer_name,
+            "device": self.device,
+            "max_context": self.max_context,
+        }
+
+    def _batch_cache_key(self, kwargs: dict[str, Any]) -> tuple[Any, ...]:
+        symbols = tuple(str(symbol).upper() for symbol in kwargs.get("symbols", []))
+        return (
+            symbols,
+            str(kwargs.get("interval", "15m")),
+            int(kwargs.get("lookback", 256)),
+            int(kwargs.get("pred_len", 1)),
+            int(kwargs.get("sample_count", 5)),
+            int(kwargs.get("top_k", 0)),
+            float(kwargs.get("top_p", 0.9)),
+            float(kwargs.get("temperature", 1.0)),
+            float(kwargs.get("neutral_threshold_pct", 0.2)),
+            int(kwargs.get("confidence_samples", 1)),
+        )
 
     def predict(self, **kwargs: Any) -> dict[str, Any]:
-        with self._lock:
+        with self._predict_gate:
             result = asyncio.run(
                 predict_binance_direction_with_predictor_async(
                     predictor=self.predictor,
@@ -635,12 +687,41 @@ class LivePredictionService:
             "prediction": prediction.to_dict(orient="records"),
             "summary": summary,
             "samples": samples,
-            "model_info": {
-                "model_name": self.model_name,
-                "tokenizer_name": self.tokenizer_name,
-                "device": self.device,
-                "max_context": self.max_context,
-            },
+            "model_info": self._model_info(),
+        }
+
+    def predict_many(self, **kwargs: Any) -> dict[str, Any]:
+        cache_key = self._batch_cache_key(kwargs)
+        now = time.monotonic()
+
+        with self._cache_lock:
+            cached = self._batch_cache.get(cache_key)
+            if cached is not None:
+                cached_at, cached_result = cached
+                if now - cached_at <= self.cache_ttl_seconds:
+                    return {
+                        "items": [dict(item) for item in cached_result["items"]],
+                        "symbols": list(cached_result["symbols"]),
+                        "model_info": self._model_info(),
+                        "cached": True,
+                    }
+
+        with self._predict_gate:
+            result = asyncio.run(
+                predict_binance_direction_batch_with_predictor_async(
+                    predictor=self.predictor,
+                    **kwargs,
+                )
+            )
+
+        with self._cache_lock:
+            self._batch_cache[cache_key] = (time.monotonic(), dict(result))
+
+        return {
+            "items": [dict(item) for item in result["items"]],
+            "symbols": list(result["symbols"]),
+            "model_info": self._model_info(),
+            "cached": False,
         }
 
 
@@ -686,19 +767,49 @@ class LivePredictionRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path.startswith("/top-symbols"):
+            from urllib.parse import parse_qs, urlparse
+
+            query = parse_qs(urlparse(self.path).query)
+            limit = int(query.get("limit", [str(DEFAULT_TOP_SYMBOL_LIMIT)])[0])
+            tickers = fetch_binance_top_usdt_symbols(limit=limit)
+            self._write_json(200, {"items": tickers, "count": len(tickers)})
+            return
+
         self._write_json(404, {"error": "Not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") != "/predict":
+        path = self.path.rstrip("/")
+        if path not in {"/predict", "/predict/batch"}:
             self._write_json(404, {"error": "Not found"})
             return
 
         try:
             payload = self._read_json_body()
             service: LivePredictionService = self.server.live_service  # type: ignore[attr-defined]
-            result = service.predict(
-                symbol=str(payload.get("symbol", "BTCUSDT")),
-                interval=str(payload.get("interval", "5m")),
+            if path == "/predict":
+                result = service.predict(
+                    symbol=str(payload.get("symbol", "BTCUSDT")),
+                    interval=str(payload.get("interval", "5m")),
+                    lookback=int(payload.get("lookback", 256)),
+                    pred_len=int(payload.get("pred_len", 1)),
+                    sample_count=int(payload.get("sample_count", 5)),
+                    top_k=int(payload.get("top_k", 0)),
+                    top_p=float(payload.get("top_p", 0.9)),
+                    temperature=float(payload.get("temperature", 1.0)),
+                    neutral_threshold_pct=float(payload.get("neutral_threshold_pct", 0.2)),
+                    confidence_samples=int(payload.get("confidence_samples", 5)),
+                )
+                self._write_json(200, {"success": True, **result})
+                return
+
+            raw_symbols = payload.get("symbols", [])
+            if not isinstance(raw_symbols, list):
+                raise ValueError("symbols must be a list.")
+
+            result = service.predict_many(
+                symbols=[str(symbol) for symbol in raw_symbols],
+                interval=str(payload.get("interval", "15m")),
                 lookback=int(payload.get("lookback", 256)),
                 pred_len=int(payload.get("pred_len", 1)),
                 sample_count=int(payload.get("sample_count", 5)),
@@ -706,7 +817,7 @@ class LivePredictionRequestHandler(BaseHTTPRequestHandler):
                 top_p=float(payload.get("top_p", 0.9)),
                 temperature=float(payload.get("temperature", 1.0)),
                 neutral_threshold_pct=float(payload.get("neutral_threshold_pct", 0.2)),
-                confidence_samples=int(payload.get("confidence_samples", 5)),
+                confidence_samples=int(payload.get("confidence_samples", 1)),
             )
             self._write_json(200, {"success": True, **result})
         except Exception as exc:
@@ -723,12 +834,16 @@ def run_live_prediction_server(
     model_name: str = DEFAULT_MODEL_NAME,
     device: Optional[str] = None,
     max_context: int = 512,
+    cache_ttl_seconds: int = 30,
+    max_concurrent_predictions: int = 2,
 ) -> None:
     service = LivePredictionService(
         tokenizer_name=tokenizer_name,
         model_name=model_name,
         device=device,
         max_context=max_context,
+        cache_ttl_seconds=cache_ttl_seconds,
+        max_concurrent_predictions=max_concurrent_predictions,
     )
     httpd = ThreadingHTTPServer((host, port), LivePredictionRequestHandler)
     httpd.live_service = service  # type: ignore[attr-defined]
@@ -1159,6 +1274,114 @@ async def predict_binance_direction_with_predictor_async(
     return {"prediction": pred_df, "summary": summary, "samples": sample_summaries}
 
 
+async def predict_binance_direction_batch_with_predictor_async(
+    predictor: Any,
+    symbols: list[str],
+    interval: str,
+    lookback: int,
+    pred_len: int = 1,
+    sample_count: int = 5,
+    top_k: int = 0,
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+    neutral_threshold_pct: float = 0.2,
+    confidence_samples: int = 5,
+) -> dict[str, Any]:
+    normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+    if not normalized_symbols:
+        raise ValueError("symbols must not be empty.")
+
+    unique_symbols: list[str] = []
+    seen: set[str] = set()
+    for symbol in normalized_symbols:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        unique_symbols.append(symbol)
+
+    history_limit = max(lookback + pred_len, lookback)
+    histories, live_prices = await asyncio.gather(
+        asyncio.gather(*(fetch_binance_klines_async(symbol, interval, history_limit) for symbol in unique_symbols)),
+        asyncio.gather(*(fetch_binance_spot_price_async(symbol) for symbol in unique_symbols)),
+    )
+
+    usable_symbols: list[str] = []
+    contexts: list[pd.DataFrame] = []
+    x_timestamps: list[pd.Series] = []
+    y_timestamps: list[pd.Series] = []
+    live_price_values: list[float] = []
+
+    for symbol, history, live_price in zip(unique_symbols, histories, live_prices):
+        if len(history) < lookback + pred_len:
+            continue
+        context = history.tail(lookback).reset_index(drop=True)
+        usable_symbols.append(symbol)
+        contexts.append(context)
+        x_timestamps.append(context["timestamps"])
+        y_timestamps.append(build_future_timestamps(context["timestamps"].iloc[-1], interval, pred_len))
+        live_price_values.append(float(live_price))
+
+    if not usable_symbols:
+        raise ValueError("No symbols had enough history for prediction.")
+
+    pred_frames = predictor.predict_batch(
+        df_list=[context[["open", "high", "low", "close", "volume", "amount"]] for context in contexts],
+        x_timestamp_list=x_timestamps,
+        y_timestamp_list=y_timestamps,
+        pred_len=pred_len,
+        T=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        sample_count=sample_count,
+        verbose=False,
+    )
+
+    items: list[dict[str, Any]] = []
+    for rank, (symbol, pred_df, context, live_price) in enumerate(
+        zip(usable_symbols, pred_frames, contexts, live_price_values),
+        start=1,
+    ):
+        summary = predict_direction_from_prediction_frame(pred_df, context, live_price)
+        summary["signal"] = signal_from_change_pct(summary["close_change_pct"], neutral_threshold_pct)
+        summary["action"] = action_from_signal(summary["signal"])
+
+        sample_summaries = [summary]
+        if confidence_samples > 1:
+            sample_summaries = await asyncio.gather(
+                *[
+                    asyncio.to_thread(
+                        build_sample_summary,
+                        predictor,
+                        context,
+                        x_timestamps[rank - 1],
+                        y_timestamps[rank - 1],
+                        pred_len,
+                        top_k,
+                        top_p,
+                        temperature,
+                        live_price,
+                        neutral_threshold_pct,
+                    )
+                    for _ in range(confidence_samples)
+                ]
+            )
+
+        direction_score = score_sampled_directions([item["signal"] for item in sample_summaries])
+        summary["confidence"] = direction_score["confidence"]
+        summary["trade_confidence"] = direction_score["trade_confidence"]
+        summary["confidence_samples"] = direction_score["sample_count"]
+        summary["dominant_signal"] = direction_score["dominant_signal"]
+        summary["signal_counts"] = direction_score["counts"]
+        summary["neutral_threshold_pct"] = neutral_threshold_pct
+        summary["verdict"] = verdict_from_summary(summary)
+        items.append(dashboard_row_from_summary(symbol, summary, source="Top 30", rank=rank))
+
+    return {
+        "items": items,
+        "symbols": usable_symbols,
+    }
+
+
 def predict_binance_direction(
     symbol: str,
     interval: str,
@@ -1239,6 +1462,85 @@ async def predict_binance_direction_async(
         confidence_samples=confidence_samples,
         history=history,
         live_price=live_price,
+    )
+
+
+def predict_binance_direction_batch(
+    symbols: list[str],
+    interval: str,
+    lookback: int,
+    pred_len: int = 1,
+    sample_count: int = 5,
+    top_k: int = 0,
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+    neutral_threshold_pct: float = 0.2,
+    confidence_samples: int = 5,
+    device: Optional[str] = None,
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+    model_name: str = DEFAULT_MODEL_NAME,
+    max_context: int = 512,
+):
+    return asyncio.run(
+        predict_binance_direction_batch_async(
+            symbols=symbols,
+            interval=interval,
+            lookback=lookback,
+            pred_len=pred_len,
+            sample_count=sample_count,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            neutral_threshold_pct=neutral_threshold_pct,
+            confidence_samples=confidence_samples,
+            device=device,
+            tokenizer_name=tokenizer_name,
+            model_name=model_name,
+            max_context=max_context,
+        )
+    )
+
+
+async def predict_binance_direction_batch_async(
+    symbols: list[str],
+    interval: str,
+    lookback: int,
+    pred_len: int = 1,
+    sample_count: int = 5,
+    top_k: int = 0,
+    top_p: float = 0.9,
+    temperature: float = 1.0,
+    neutral_threshold_pct: float = 0.2,
+    confidence_samples: int = 5,
+    device: Optional[str] = None,
+    tokenizer_name: str = DEFAULT_TOKENIZER_NAME,
+    model_name: str = DEFAULT_MODEL_NAME,
+    max_context: int = 512,
+):
+    predictor_task = asyncio.create_task(
+        load_pretrained_predictor_async(
+            tokenizer_name=tokenizer_name,
+            model_name=model_name,
+            device=device,
+            max_context=max_context,
+        )
+    )
+    result = await asyncio.gather(
+        predictor_task,
+    )
+    predictor = result[0]
+    return await predict_binance_direction_batch_with_predictor_async(
+        predictor=predictor,
+        symbols=symbols,
+        interval=interval,
+        lookback=lookback,
+        pred_len=pred_len,
+        sample_count=sample_count,
+        top_k=top_k,
+        top_p=top_p,
+        temperature=temperature,
+        neutral_threshold_pct=neutral_threshold_pct,
+        confidence_samples=confidence_samples,
     )
 
 
@@ -1492,6 +1794,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=5,
         help="How many single-sample forecasts to use for confidence scoring",
     )
+    parser.add_argument(
+        "--cache-ttl-seconds",
+        type=int,
+        default=30,
+        help="How long to reuse batch prediction results before recomputing them.",
+    )
+    parser.add_argument(
+        "--max-concurrent-predictions",
+        type=int,
+        default=2,
+        help="How many symbol predictions can run in parallel in the warm server.",
+    )
     parser.add_argument("--device", type=str, default=None, help="Torch device, e.g. cuda:0 or cpu")
     parser.add_argument(
         "--tokenizer-name",
@@ -1569,6 +1883,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             model_name=model_name,
             device=args.device,
             max_context=args.max_context,
+            cache_ttl_seconds=args.cache_ttl_seconds,
+            max_concurrent_predictions=args.max_concurrent_predictions,
         )
         return 0
 

@@ -1,0 +1,48 @@
+services:
+  predictor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      KRONOS_MODEL_SIZE: ${KRONOS_MODEL_SIZE:-base}
+      KRONOS_HOST: 0.0.0.0
+      KRONOS_PORT: 8765
+      KRONOS_CACHE_TTL_SECONDS: 10
+      KRONOS_MAX_CONCURRENT_PREDICTIONS: 2
+    ports:
+      - "8765:8765"
+    volumes:
+      - kronos-model-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request; print(json.load(urllib.request.urlopen('http://127.0.0.1:8765/health'))['ok'])"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: webui/Dockerfile
+    depends_on:
+      predictor:
+        condition: service_healthy
+    environment:
+      KRONOS_BACKEND_URL: http://predictor:8765
+      DASHBOARD_WATCHLIST_PATH: /data/custom_coins.json
+      DASHBOARD_REFRESH_SECONDS: 10
+      DASHBOARD_INTERVAL: 15m
+      DASHBOARD_LOOKBACK: 256
+      DASHBOARD_PRED_LEN: 1
+      DASHBOARD_SAMPLE_COUNT: 5
+      DASHBOARD_CONFIDENCE_SAMPLES: 5
+      DASHBOARD_TOP_SYMBOL_LIMIT: 10
+      DASHBOARD_NEUTRAL_THRESHOLD_PCT: 0.05
+    ports:
+      - "7070:7070"
+    volumes:
+      - kronos-watchlist:/data
+
+volumes:
+  kronos-model-cache:
+  kronos-watchlist:

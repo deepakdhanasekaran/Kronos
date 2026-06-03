@@ -92,6 +92,48 @@ We release a family of pre-trained models with varying capacities to suit differ
 pip install -r requirements.txt
 ```
 
+### Docker Dashboard
+
+Run the warm predictor backend and the dashboard together with Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+- Dashboard: `http://localhost:7070`
+- Predictor API health: `http://localhost:8765/health`
+
+Environment variables you can override:
+
+- `KRONOS_MODEL_SIZE` - `small` or `base` for the backend model
+- `KRONOS_HOST` and `KRONOS_PORT` - backend listen address
+- `KRONOS_MAX_CONCURRENT_PREDICTIONS` - how many symbol predictions the warm server can process in parallel
+- `KRONOS_BACKEND_URL` - dashboard-to-backend URL
+- `DASHBOARD_REFRESH_SECONDS` - dashboard refresh cadence
+- `DASHBOARD_WATCHLIST_PATH` - mounted custom coin registry path
+- `DASHBOARD_INTERVAL`, `DASHBOARD_LOOKBACK`, `DASHBOARD_PRED_LEN` - prediction window settings
+- `DASHBOARD_SAMPLE_COUNT`, `DASHBOARD_CONFIDENCE_SAMPLES` - prediction stability controls
+
+Custom coins are persisted in the mounted watchlist volume, so they survive container restarts.
+
+### 🧪 Paper Trading Bot
+
+If you want to simulate Binance-like spot orders without risking real funds, run the paper trading bot against the warm backend:
+
+```bash
+python scripts/binance_paper_trade_bot.py \
+  --live-url http://127.0.0.1:8765 \
+  --symbols BTCUSDT,ETHUSDT \
+  --interval 15m \
+  --pred-len 1 \
+  --neutral-threshold-pct 0.05 \
+  --confidence-samples 5
+```
+
+The bot keeps a separate paper session per symbol, applies spot-style buy/sell fills with fees and slippage, and refreshes BTC and ETH concurrently so one symbol does not wait on the other.
+
 ### 📈 Making Forecasts
 
 Forecasting with Kronos is straightforward using the `KronosPredictor` class. It handles data preprocessing, normalization, prediction, and inverse normalization, allowing you to get from raw data to forecasts in just a few lines of code.

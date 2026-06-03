@@ -1,4 +1,7 @@
+import asyncio
 import json
+import threading
+import time
 from datetime import timedelta
 
 import pandas as pd
@@ -21,12 +24,14 @@ from crypto_predictor import (
     load_jsonl_records,
     market_is_closed,
     polymarket_action_from_probability,
+    fetch_binance_top_usdt_symbols,
     resolve_current_polymarket_slug,
     score_sampled_directions,
     signal_from_change_pct,
     render_overnight_audit_report,
     render_cli_output,
     prepare_ohlcv_frame,
+    LivePredictionService,
     verdict_from_summary,
 )
 
@@ -590,3 +595,213 @@ def test_render_overnight_audit_report_formats_summary_and_table():
     assert "| Cycle | Timestamp" in report
     assert "2026-06-01T19:30:00Z" in report
     assert "71452.5547" in report
+
+
+def test_fetch_binance_top_usdt_symbols_ranks_only_usdt_pairs(monkeypatch):
+    payload = [
+        {"symbol": "BTCUSDT", "quoteVolume": "1000", "lastPrice": "1", "priceChangePercent": "2.5"},
+        {"symbol": "ETHUSDT", "quoteVolume": "800", "lastPrice": "2", "priceChangePercent": "1.5"},
+        {"symbol": "BTCBUSD", "quoteVolume": "9999"},
+    ]
+
+    monkeypatch.setattr("crypto_predictor.fetch_json", lambda url, headers=None: json.dumps(payload))
+
+    ranked = fetch_binance_top_usdt_symbols(limit=2)
+
+    assert [item["symbol"] for item in ranked] == ["BTCUSDT", "ETHUSDT"]
+    assert ranked[0]["rank"] == 1
+    assert ranked[1]["rank"] == 2
+
+
+def test_live_prediction_service_predict_many_returns_batch_shape(monkeypatch):
+    service = LivePredictionService.__new__(LivePredictionService)
+    service.predictor = object()
+    service.model_name = "NeoQuasar/Kronos-base"
+    service.tokenizer_name = "NeoQuasar/Kronos-Tokenizer-base"
+    service.device = "cpu"
+    service.max_context = 512
+    service.cache_ttl_seconds = 30
+    service.max_concurrent_predictions = 2
+    service._predict_gate = threading.Semaphore(2)
+    service._cache_lock = threading.Lock()
+    service._batch_cache = {}
+
+    async def fake_batch(**kwargs):
+        return {
+            "items": [
+                {
+                    "symbol": symbol,
+                    "rank": index + 1,
+                    "source": "Top 30",
+                    "last_close": 100.0 + index,
+                    "predicted_close": 101.0 + index,
+                    "verdict": "Strong BUY",
+                    "action": "BUY",
+                    "signal": "UP",
+                    "agreement": 0.6,
+                    "trade_confidence": 0.6,
+                    "signal_counts": {"UP": 2, "DOWN": 3, "NEUTRAL": 0},
+                }
+                for index, symbol in enumerate(kwargs["symbols"])
+            ],
+            "symbols": kwargs["symbols"],
+        }
+
+    monkeypatch.setattr("crypto_predictor.predict_binance_direction_batch_with_predictor_async", fake_batch)
+
+    result = service.predict_many(
+        symbols=["BTCUSDT", "ETHUSDT"],
+        interval="15m",
+        lookback=256,
+        pred_len=1,
+        sample_count=5,
+        top_k=0,
+        top_p=0.9,
+        temperature=1.0,
+        neutral_threshold_pct=0.05,
+        confidence_samples=1,
+    )
+
+    assert result["model_info"]["model_name"] == "NeoQuasar/Kronos-base"
+    assert [item["symbol"] for item in result["items"]] == ["BTCUSDT", "ETHUSDT"]
+    assert result["items"][0]["agreement"] == 0.6
+
+
+def test_live_prediction_service_predict_many_uses_cache(monkeypatch):
+    service = LivePredictionService.__new__(LivePredictionService)
+    service.predictor = object()
+    service.model_name = "NeoQuasar/Kronos-base"
+    service.tokenizer_name = "NeoQuasar/Kronos-Tokenizer-base"
+    service.device = "cpu"
+    service.max_context = 512
+    service.cache_ttl_seconds = 60
+    service.max_concurrent_predictions = 2
+    service._predict_gate = threading.Semaphore(2)
+    service._cache_lock = threading.Lock()
+    service._batch_cache = {}
+
+    calls = {"count": 0}
+
+    async def fake_batch(**kwargs):
+        calls["count"] += 1
+        return {
+            "items": [
+                {
+                    "symbol": "BTCUSDT",
+                    "rank": 1,
+                    "source": "Top 30",
+                    "last_close": 100.0,
+                    "predicted_close": 101.0,
+                    "verdict": "Strong BUY",
+                    "action": "BUY",
+                    "signal": "UP",
+                    "agreement": 0.6,
+                    "trade_confidence": 0.6,
+                    "signal_counts": {"UP": 2, "DOWN": 3, "NEUTRAL": 0},
+                }
+            ],
+            "symbols": kwargs["symbols"],
+        }
+
+    monkeypatch.setattr("crypto_predictor.predict_binance_direction_batch_with_predictor_async", fake_batch)
+
+    first = service.predict_many(
+        symbols=["BTCUSDT"],
+        interval="15m",
+        lookback=256,
+        pred_len=1,
+        sample_count=5,
+        top_k=0,
+        top_p=0.9,
+        temperature=1.0,
+        neutral_threshold_pct=0.05,
+        confidence_samples=1,
+    )
+    second = service.predict_many(
+        symbols=["BTCUSDT"],
+        interval="15m",
+        lookback=256,
+        pred_len=1,
+        sample_count=5,
+        top_k=0,
+        top_p=0.9,
+        temperature=1.0,
+        neutral_threshold_pct=0.05,
+        confidence_samples=1,
+    )
+
+    assert calls["count"] == 1
+    assert first["cached"] is False
+    assert second["cached"] is True
+
+
+def test_live_prediction_service_allows_parallel_single_symbol_predictions(monkeypatch):
+    service = LivePredictionService.__new__(LivePredictionService)
+    service.predictor = object()
+    service.model_name = "NeoQuasar/Kronos-base"
+    service.tokenizer_name = "NeoQuasar/Kronos-Tokenizer-base"
+    service.device = "cpu"
+    service.max_context = 512
+    service.cache_ttl_seconds = 0
+    service.max_concurrent_predictions = 2
+    service._predict_gate = threading.Semaphore(2)
+    service._cache_lock = threading.Lock()
+    service._batch_cache = {}
+
+    started = []
+    release = threading.Event()
+
+    async def fake_predict(**kwargs):
+        started.append(kwargs["symbol"])
+        await asyncio.to_thread(release.wait)
+        return {
+            "prediction": pd.DataFrame([{"close": 101.0}]),
+            "summary": {
+                "symbol": kwargs["symbol"],
+                "last_close": 100.0,
+                "predicted_close": 101.0,
+                "live_price": 100.0,
+                "signal": "UP",
+                "action": "BUY",
+                "verdict": "Strong BUY",
+                "confidence": 0.6,
+                "trade_confidence": 0.6,
+                "confidence_samples": 1,
+                "signal_counts": {"UP": 1, "DOWN": 0, "NEUTRAL": 0},
+            },
+            "samples": [],
+        }
+
+    monkeypatch.setattr("crypto_predictor.predict_binance_direction_with_predictor_async", fake_predict)
+
+    results: dict[str, dict] = {}
+
+    def run(symbol: str) -> None:
+        results[symbol] = service.predict(
+            symbol=symbol,
+            interval="15m",
+            lookback=256,
+            pred_len=1,
+            sample_count=5,
+            top_k=0,
+            top_p=0.9,
+            temperature=1.0,
+            neutral_threshold_pct=0.05,
+            confidence_samples=1,
+        )
+
+    threads = [threading.Thread(target=run, args=("BTCUSDT",)), threading.Thread(target=run, args=("ETHUSDT",))]
+    for thread in threads:
+        thread.start()
+
+    for _ in range(20):
+        if len(started) >= 2:
+            break
+        time.sleep(0.05)
+
+    assert sorted(started) == ["BTCUSDT", "ETHUSDT"]
+    release.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert set(results) == {"BTCUSDT", "ETHUSDT"}

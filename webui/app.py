@@ -1,708 +1,706 @@
-import os
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
 import json
-import plotly.graph_objects as go
-import plotly.utils
-from flask import Flask, render_template, request, jsonify
-from flask_cors import CORS
+import os
 import sys
-import warnings
-import datetime
-warnings.filterwarnings('ignore')
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-# Add project root directory to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from flask import Flask, jsonify, render_template, request
 
-try:
-    from model import Kronos, KronosTokenizer, KronosPredictor
-    MODEL_AVAILABLE = True
-except ImportError:
-    MODEL_AVAILABLE = False
-    print("Warning: Kronos model cannot be imported, will use simulated data for demonstration")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
-app = Flask(__name__)
-CORS(app)
+from dashboard_support import (
+    DEFAULT_DASHBOARD_INTERVAL,
+    DEFAULT_DASHBOARD_LOOKBACK,
+    DEFAULT_DASHBOARD_PRED_LEN,
+    DEFAULT_REFRESH_SECONDS,
+    DEFAULT_TOP_SYMBOL_LIMIT,
+    WatchlistStore,
+    dashboard_placeholder_row,
+    dashboard_row_from_summary,
+    dedupe_symbols,
+    merge_symbol_lists,
+    normalize_symbol,
+    validate_usdt_symbol,
+)
 
-# Global variables to store models
-tokenizer = None
-model = None
-predictor = None
 
-# Available model configurations
-AVAILABLE_MODELS = {
-    'kronos-mini': {
-        'name': 'Kronos-mini',
-        'model_id': 'NeoQuasar/Kronos-mini',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-2k',
-        'context_length': 2048,
-        'params': '4.1M',
-        'description': 'Lightweight model, suitable for fast prediction'
-    },
-    'kronos-small': {
-        'name': 'Kronos-small',
-        'model_id': 'NeoQuasar/Kronos-small',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
-        'context_length': 512,
-        'params': '24.7M',
-        'description': 'Small model, balanced performance and speed'
-    },
-    'kronos-base': {
-        'name': 'Kronos-base',
-        'model_id': 'NeoQuasar/Kronos-base',
-        'tokenizer_id': 'NeoQuasar/Kronos-Tokenizer-base',
-        'context_length': 512,
-        'params': '102.3M',
-        'description': 'Base model, provides better prediction quality'
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _backend_request_json(
+    backend_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout: int = 300,
+) -> dict[str, Any]:
+    url = backend_url.rstrip("/") + path
+    body = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    request_obj = Request(url, data=body, headers=headers, method=method)
+    try:
+        with urlopen(request_obj, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else exc.reason
+        raise RuntimeError(f"Backend request failed ({exc.code}): {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Backend unavailable: {exc.reason}") from exc
+
+
+def _load_custom_symbols(store: WatchlistStore) -> list[str]:
+    try:
+        return store.load()
+    except ValueError:
+        return []
+
+
+def create_app(config: dict[str, Any] | None = None) -> Flask:
+    app = Flask(__name__)
+
+    defaults = {
+        "BACKEND_URL": os.environ.get("KRONOS_BACKEND_URL", "http://127.0.0.1:8765"),
+        "WATCHLIST_PATH": os.environ.get("DASHBOARD_WATCHLIST_PATH", "/data/custom_coins.json"),
+        "DASHBOARD_INTERVAL": os.environ.get("DASHBOARD_INTERVAL", DEFAULT_DASHBOARD_INTERVAL),
+        "DASHBOARD_LOOKBACK": _env_int("DASHBOARD_LOOKBACK", DEFAULT_DASHBOARD_LOOKBACK),
+        "DASHBOARD_PRED_LEN": _env_int("DASHBOARD_PRED_LEN", DEFAULT_DASHBOARD_PRED_LEN),
+        "DASHBOARD_REFRESH_SECONDS": _env_int("DASHBOARD_REFRESH_SECONDS", DEFAULT_REFRESH_SECONDS),
+        "DASHBOARD_SAMPLE_COUNT": _env_int("DASHBOARD_SAMPLE_COUNT", 5),
+        "DASHBOARD_CONFIDENCE_SAMPLES": _env_int("DASHBOARD_CONFIDENCE_SAMPLES", 1),
+        "DASHBOARD_TOP_K": _env_int("DASHBOARD_TOP_K", 0),
+        "DASHBOARD_TOP_P": float(os.environ.get("DASHBOARD_TOP_P", "0.9")),
+        "DASHBOARD_TEMPERATURE": float(os.environ.get("DASHBOARD_TEMPERATURE", "1.0")),
+        "DASHBOARD_NEUTRAL_THRESHOLD_PCT": float(os.environ.get("DASHBOARD_NEUTRAL_THRESHOLD_PCT", "0.05")),
+        "DASHBOARD_TOP_SYMBOL_LIMIT": _env_int("DASHBOARD_TOP_SYMBOL_LIMIT", DEFAULT_TOP_SYMBOL_LIMIT),
+        "DASHBOARD_BACKGROUND_REFRESH": os.environ.get("DASHBOARD_BACKGROUND_REFRESH", "1") not in {"0", "false", "False"},
     }
-}
+    app.config.from_mapping(defaults)
+    if config:
+        app.config.update(config)
 
-def load_data_files():
-    """Scan data directory and return available data files"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
-    data_files = []
-    
-    if os.path.exists(data_dir):
-        for file in os.listdir(data_dir):
-            if file.endswith(('.csv', '.feather')):
-                file_path = os.path.join(data_dir, file)
-                file_size = os.path.getsize(file_path)
-                data_files.append({
-                    'name': file,
-                    'path': file_path,
-                    'size': f"{file_size / 1024:.1f} KB" if file_size < 1024*1024 else f"{file_size / (1024*1024):.1f} MB"
-                })
-    
-    return data_files
+    watchlist_store = WatchlistStore(app.config["WATCHLIST_PATH"])
+    app.extensions["watchlist_store"] = watchlist_store
 
-def load_data_file(file_path):
-    """Load data file"""
-    try:
-        if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path)
-        elif file_path.endswith('.feather'):
-            df = pd.read_feather(file_path)
+    snapshot_lock = threading.Lock()
+    snapshot_state: dict[str, Any] = {
+        "data": None,
+        "refreshing": False,
+        "last_error": None,
+        "last_refreshed_at": None,
+    }
+    refresh_event = threading.Event()
+    stop_event = threading.Event()
+
+    def get_backend_health() -> dict[str, Any]:
+        return _backend_request_json(app.config["BACKEND_URL"], "/health")
+
+    def get_top_symbols() -> list[dict[str, Any]]:
+        response = _backend_request_json(
+            app.config["BACKEND_URL"],
+            f"/top-symbols?{urlencode({'limit': app.config['DASHBOARD_TOP_SYMBOL_LIMIT']})}",
+        )
+        items = response.get("items", [])
+        return [item for item in items if isinstance(item, dict)]
+
+    def build_dashboard_payload(selected_top_symbols: list[str] | None = None) -> dict[str, Any]:
+        top_items = get_top_symbols()
+        top_symbols = [normalize_symbol(item.get("symbol")) for item in top_items]
+        custom_symbols = _load_custom_symbols(watchlist_store)
+        if selected_top_symbols is None:
+            active_top_symbols = top_symbols
+            annotated_top_items = [dict(item, selected=True) for item in top_items]
         else:
-            return None, "Unsupported file format"
-        
-        # Check required columns
-        required_cols = ['open', 'high', 'low', 'close']
-        if not all(col in df.columns for col in required_cols):
-            return None, f"Missing required columns: {required_cols}"
-        
-        # Process timestamp column
-        if 'timestamps' in df.columns:
-            df['timestamps'] = pd.to_datetime(df['timestamps'])
-        elif 'timestamp' in df.columns:
-            df['timestamps'] = pd.to_datetime(df['timestamp'])
-        elif 'date' in df.columns:
-            # If column name is 'date', rename it to 'timestamps'
-            df['timestamps'] = pd.to_datetime(df['date'])
-        else:
-            # If no timestamp column exists, create one
-            df['timestamps'] = pd.date_range(start='2024-01-01', periods=len(df), freq='1H')
-        
-        # Ensure numeric columns are numeric type
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Process volume column (optional)
-        if 'volume' in df.columns:
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-        
-        # Process amount column (optional, but not used for prediction)
-        if 'amount' in df.columns:
-            df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-        
-        # Remove rows containing NaN values
-        df = df.dropna()
-        
-        return df, None
-        
-    except Exception as e:
-        return None, f"Failed to load file: {str(e)}"
+            selected_set = set(dedupe_symbols(selected_top_symbols))
+            active_top_symbols = [symbol for symbol in top_symbols if symbol in selected_set]
+            annotated_top_items = []
+            for item in top_items:
+                symbol = normalize_symbol(item.get("symbol"))
+                annotated = dict(item)
+                annotated["selected"] = symbol in selected_set
+                annotated_top_items.append(annotated)
+        merged_symbols = merge_symbol_lists(active_top_symbols, custom_symbols)
 
-def save_prediction_results(file_path, prediction_type, prediction_results, actual_data, input_data, prediction_params):
-    """Save prediction results to file"""
-    try:
-        # Create prediction results directory
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prediction_results')
-        os.makedirs(results_dir, exist_ok=True)
-        
-        # Generate filename
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f'prediction_{timestamp}.json'
-        filepath = os.path.join(results_dir, filename)
-        
-        # Prepare data for saving
-        save_data = {
-            'timestamp': datetime.datetime.now().isoformat(),
-            'file_path': file_path,
-            'prediction_type': prediction_type,
-            'prediction_params': prediction_params,
-            'input_data_summary': {
-                'rows': len(input_data),
-                'columns': list(input_data.columns),
-                'price_range': {
-                    'open': {'min': float(input_data['open'].min()), 'max': float(input_data['open'].max())},
-                    'high': {'min': float(input_data['high'].min()), 'max': float(input_data['high'].max())},
-                    'low': {'min': float(input_data['low'].min()), 'max': float(input_data['low'].max())},
-                    'close': {'min': float(input_data['close'].min()), 'max': float(input_data['close'].max())}
+        if merged_symbols:
+            prediction_response = _backend_request_json(
+                app.config["BACKEND_URL"],
+                "/predict/batch",
+                method="POST",
+                payload={
+                    "symbols": merged_symbols,
+                    "interval": app.config["DASHBOARD_INTERVAL"],
+                    "lookback": app.config["DASHBOARD_LOOKBACK"],
+                    "pred_len": app.config["DASHBOARD_PRED_LEN"],
+                    "sample_count": app.config["DASHBOARD_SAMPLE_COUNT"],
+                    "top_k": app.config["DASHBOARD_TOP_K"],
+                    "top_p": app.config["DASHBOARD_TOP_P"],
+                    "temperature": app.config["DASHBOARD_TEMPERATURE"],
+                    "neutral_threshold_pct": app.config["DASHBOARD_NEUTRAL_THRESHOLD_PCT"],
+                    "confidence_samples": app.config["DASHBOARD_CONFIDENCE_SAMPLES"],
                 },
-                'last_values': {
-                    'open': float(input_data['open'].iloc[-1]),
-                    'high': float(input_data['high'].iloc[-1]),
-                    'low': float(input_data['low'].iloc[-1]),
-                    'close': float(input_data['close'].iloc[-1])
-                }
-            },
-            'prediction_results': prediction_results,
-            'actual_data': actual_data,
-            'analysis': {}
+            )
+        else:
+            prediction_response = {"items": [], "model_info": {}, "cached": False}
+
+        return {
+            "generated_at": _utc_timestamp(),
+            "backend": get_backend_health(),
+            "top_symbols": annotated_top_items,
+            "custom_symbols": custom_symbols,
+            "symbols": merged_symbols,
+            "items": prediction_response.get("items", []),
+            "selected_top_symbols": active_top_symbols,
+            "model_info": prediction_response.get("model_info", {}),
+            "cached": bool(prediction_response.get("cached", False)),
+            "refresh_seconds": app.config["DASHBOARD_REFRESH_SECONDS"],
+            "interval": app.config["DASHBOARD_INTERVAL"],
+            "lookback": app.config["DASHBOARD_LOOKBACK"],
+            "pred_len": app.config["DASHBOARD_PRED_LEN"],
         }
-        
-        # If actual data exists, perform comparison analysis
-        if actual_data and len(actual_data) > 0:
-            # Calculate continuity analysis
-            if len(prediction_results) > 0 and len(actual_data) > 0:
-                last_pred = prediction_results[0]  # First prediction point
-            first_actual = actual_data[0]      # First actual point
-                
-            save_data['analysis']['continuity'] = {
-                    'last_prediction': {
-                        'open': last_pred['open'],
-                        'high': last_pred['high'],
-                        'low': last_pred['low'],
-                        'close': last_pred['close']
-                    },
-                    'first_actual': {
-                        'open': first_actual['open'],
-                        'high': first_actual['high'],
-                        'low': first_actual['low'],
-                        'close': first_actual['close']
-                    },
-                    'gaps': {
-                        'open_gap': abs(last_pred['open'] - first_actual['open']),
-                        'high_gap': abs(last_pred['high'] - first_actual['high']),
-                        'low_gap': abs(last_pred['low'] - first_actual['low']),
-                        'close_gap': abs(last_pred['close'] - first_actual['close'])
-                    },
-                    'gap_percentages': {
-                        'open_gap_pct': (abs(last_pred['open'] - first_actual['open']) / first_actual['open']) * 100,
-                        'high_gap_pct': (abs(last_pred['high'] - first_actual['high']) / first_actual['high']) * 100,
-                        'low_gap_pct': (abs(last_pred['low'] - first_actual['low']) / first_actual['low']) * 100,
-                        'close_gap_pct': (abs(last_pred['close'] - first_actual['close']) / first_actual['close']) * 100
-                    }
-                }
-        
-        # Save to file
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"Prediction results saved to: {filepath}")
-        return filepath
-        
-    except Exception as e:
-        print(f"Failed to save prediction results: {e}")
-        return None
 
-def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, historical_start_idx=0):
-    """Create prediction chart"""
-    # Use specified historical data start position, not always from the beginning of df
-    if historical_start_idx + lookback + pred_len <= len(df):
-        # Display lookback historical points + pred_len prediction points starting from specified position
-        historical_df = df.iloc[historical_start_idx:historical_start_idx+lookback]
-        prediction_range = range(historical_start_idx+lookback, historical_start_idx+lookback+pred_len)
-    else:
-        # If data is insufficient, adjust to maximum available range
-        available_lookback = min(lookback, len(df) - historical_start_idx)
-        available_pred_len = min(pred_len, max(0, len(df) - historical_start_idx - available_lookback))
-        historical_df = df.iloc[historical_start_idx:historical_start_idx+available_lookback]
-        prediction_range = range(historical_start_idx+available_lookback, historical_start_idx+available_lookback+available_pred_len)
-    
-    # Create chart
-    fig = go.Figure()
-    
-    # Add historical data (candlestick chart)
-    fig.add_trace(go.Candlestick(
-        x=historical_df['timestamps'] if 'timestamps' in historical_df.columns else historical_df.index,
-        open=historical_df['open'],
-        high=historical_df['high'],
-        low=historical_df['low'],
-        close=historical_df['close'],
-        name='Historical Data (400 data points)',
-        increasing_line_color='#26A69A',
-        decreasing_line_color='#EF5350'
-    ))
-    
-    # Add prediction data (candlestick chart)
-    if pred_df is not None and len(pred_df) > 0:
-        # Calculate prediction data timestamps - ensure continuity with historical data
-        if 'timestamps' in df.columns and len(historical_df) > 0:
-            # Start from the last timestamp of historical data, create prediction timestamps with the same time interval
-            last_timestamp = historical_df['timestamps'].iloc[-1]
-            time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(hours=1)
-            
-            pred_timestamps = pd.date_range(
-                start=last_timestamp + time_diff,
-                periods=len(pred_df),
-                freq=time_diff
-            )
-        else:
-            # If no timestamps, use index
-            pred_timestamps = range(len(historical_df), len(historical_df) + len(pred_df))
-        
-        fig.add_trace(go.Candlestick(
-            x=pred_timestamps,
-            open=pred_df['open'],
-            high=pred_df['high'],
-            low=pred_df['low'],
-            close=pred_df['close'],
-            name='Prediction Data (120 data points)',
-            increasing_line_color='#66BB6A',
-            decreasing_line_color='#FF7043'
-        ))
-    
-    # Add actual data for comparison (if exists)
-    if actual_df is not None and len(actual_df) > 0:
-        # Actual data should be in the same time period as prediction data
-        if 'timestamps' in df.columns:
-            # Actual data should use the same timestamps as prediction data to ensure time alignment
-            if 'pred_timestamps' in locals():
-                actual_timestamps = pred_timestamps
-            else:
-                # If no prediction timestamps, calculate from the last timestamp of historical data
-                if len(historical_df) > 0:
-                    last_timestamp = historical_df['timestamps'].iloc[-1]
-                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0] if len(df) > 1 else pd.Timedelta(hours=1)
-                    actual_timestamps = pd.date_range(
-                        start=last_timestamp + time_diff,
-                        periods=len(actual_df),
-                        freq=time_diff
-                    )
-                else:
-                    actual_timestamps = range(len(historical_df), len(historical_df) + len(actual_df))
-        else:
-            actual_timestamps = range(len(historical_df), len(historical_df) + len(actual_df))
-        
-        fig.add_trace(go.Candlestick(
-            x=actual_timestamps,
-            open=actual_df['open'],
-            high=actual_df['high'],
-            low=actual_df['low'],
-            close=actual_df['close'],
-            name='Actual Data (120 data points)',
-            increasing_line_color='#FF9800',
-            decreasing_line_color='#F44336'
-        ))
-    
-    # Update layout
-    fig.update_layout(
-        title='Kronos Financial Prediction Results - 400 Historical Points + 120 Prediction Points vs 120 Actual Points',
-        xaxis_title='Time',
-        yaxis_title='Price',
-        template='plotly_white',
-        height=600,
-        showlegend=True
-    )
-    
-    # Ensure x-axis time continuity
-    if 'timestamps' in historical_df.columns:
-        # Get all timestamps and sort them
-        all_timestamps = []
-        if len(historical_df) > 0:
-            all_timestamps.extend(historical_df['timestamps'])
-        if 'pred_timestamps' in locals():
-            all_timestamps.extend(pred_timestamps)
-        if 'actual_timestamps' in locals():
-            all_timestamps.extend(actual_timestamps)
-        
-        if all_timestamps:
-            all_timestamps = sorted(all_timestamps)
-            fig.update_xaxes(
-                range=[all_timestamps[0], all_timestamps[-1]],
-                rangeslider_visible=False,
-                type='date'
-            )
-    
-    return json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
-
-@app.route('/')
-def index():
-    """Home page"""
-    return render_template('index.html')
-
-@app.route('/api/data-files')
-def get_data_files():
-    """Get available data file list"""
-    data_files = load_data_files()
-    return jsonify(data_files)
-
-@app.route('/api/load-data', methods=['POST'])
-def load_data():
-    """Load data file"""
-    try:
-        data = request.get_json()
-        file_path = data.get('file_path')
-        
-        if not file_path:
-            return jsonify({'error': 'File path cannot be empty'}), 400
-        
-        df, error = load_data_file(file_path)
-        if error:
-            return jsonify({'error': error}), 400
-        
-        # Detect data time frequency
-        def detect_timeframe(df):
-            if len(df) < 2:
-                return "Unknown"
-            
-            time_diffs = []
-            for i in range(1, min(10, len(df))):  # Check first 10 time differences
-                diff = df['timestamps'].iloc[i] - df['timestamps'].iloc[i-1]
-                time_diffs.append(diff)
-            
-            if not time_diffs:
-                return "Unknown"
-            
-            # Calculate average time difference
-            avg_diff = sum(time_diffs, pd.Timedelta(0)) / len(time_diffs)
-            
-            # Convert to readable format
-            if avg_diff < pd.Timedelta(minutes=1):
-                return f"{avg_diff.total_seconds():.0f} seconds"
-            elif avg_diff < pd.Timedelta(hours=1):
-                return f"{avg_diff.total_seconds() / 60:.0f} minutes"
-            elif avg_diff < pd.Timedelta(days=1):
-                return f"{avg_diff.total_seconds() / 3600:.0f} hours"
-            else:
-                return f"{avg_diff.days} days"
-        
-        # Return data information
-        data_info = {
-            'rows': len(df),
-            'columns': list(df.columns),
-            'start_date': df['timestamps'].min().isoformat() if 'timestamps' in df.columns else 'N/A',
-            'end_date': df['timestamps'].max().isoformat() if 'timestamps' in df.columns else 'N/A',
-            'price_range': {
-                'min': float(df[['open', 'high', 'low', 'close']].min().min()),
-                'max': float(df[['open', 'high', 'low', 'close']].max().max())
-            },
-            'prediction_columns': ['open', 'high', 'low', 'close'] + (['volume'] if 'volume' in df.columns else []),
-            'timeframe': detect_timeframe(df)
+    def build_placeholder_payload() -> dict[str, Any]:
+        return {
+            "generated_at": _utc_timestamp(),
+            "backend": {"ok": False, "status": "warming"},
+            "top_symbols": [],
+            "custom_symbols": [],
+            "symbols": [],
+            "items": [],
+            "selected_top_symbols": [],
+            "model_info": {},
+            "cached": False,
+            "refresh_seconds": app.config["DASHBOARD_REFRESH_SECONDS"],
+            "interval": app.config["DASHBOARD_INTERVAL"],
+            "lookback": app.config["DASHBOARD_LOOKBACK"],
+            "pred_len": app.config["DASHBOARD_PRED_LEN"],
         }
-        
-        return jsonify({
-            'success': True,
-            'data_info': data_info,
-            'message': f'Successfully loaded data, total {len(df)} rows'
-        })
-        
-    except Exception as e:
-        return jsonify({'error': f'Failed to load data: {str(e)}'}), 500
 
-@app.route('/api/predict', methods=['POST'])
-def predict():
-    """Perform prediction"""
-    try:
-        data = request.get_json()
-        file_path = data.get('file_path')
-        lookback = int(data.get('lookback', 400))
-        pred_len = int(data.get('pred_len', 120))
-        
-        # Get prediction quality parameters
-        temperature = float(data.get('temperature', 1.0))
-        top_p = float(data.get('top_p', 0.9))
-        sample_count = int(data.get('sample_count', 1))
-        
-        if not file_path:
-            return jsonify({'error': 'File path cannot be empty'}), 400
-        
-        # Load data
-        df, error = load_data_file(file_path)
-        if error:
-            return jsonify({'error': error}), 400
-        
-        if len(df) < lookback:
-            return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
-        
-        # Perform prediction
-        if MODEL_AVAILABLE and predictor is not None:
-            try:
-                # Use real Kronos model
-                # Only use necessary columns: OHLCV, excluding amount
-                required_cols = ['open', 'high', 'low', 'close']
-                if 'volume' in df.columns:
-                    required_cols.append('volume')
-                
-                # Process time period selection
-                start_date = data.get('start_date')
-                
-                if start_date:
-                    # Custom time period - fix logic: use data within selected window
-                    start_dt = pd.to_datetime(start_date)
-                    
-                    # Find data after start time
-                    mask = df['timestamps'] >= start_dt
-                    time_range_df = df[mask]
-                    
-                    # Ensure sufficient data: lookback + pred_len
-                    if len(time_range_df) < lookback + pred_len:
-                        return jsonify({'error': f'Insufficient data from start time {start_dt.strftime("%Y-%m-%d %H:%M")}, need at least {lookback + pred_len} data points, currently only {len(time_range_df)} available'}), 400
-                    
-                    # Use first lookback data points within selected window for prediction
-                    x_df = time_range_df.iloc[:lookback][required_cols]
-                    x_timestamp = time_range_df.iloc[:lookback]['timestamps']
-                    
-                    # Use last pred_len data points within selected window as actual values
-                    y_timestamp = time_range_df.iloc[lookback:lookback+pred_len]['timestamps']
-                    
-                    # Calculate actual time period length
-                    start_timestamp = time_range_df['timestamps'].iloc[0]
-                    end_timestamp = time_range_df['timestamps'].iloc[lookback+pred_len-1]
-                    time_span = end_timestamp - start_timestamp
-                    
-                    prediction_type = f"Kronos model prediction (within selected window: first {lookback} data points for prediction, last {pred_len} data points for comparison, time span: {time_span})"
-                else:
-                    # Use latest data
-                    x_df = df.iloc[:lookback][required_cols]
-                    x_timestamp = df.iloc[:lookback]['timestamps']
-                    y_timestamp = df.iloc[lookback:lookback+pred_len]['timestamps']
-                    prediction_type = "Kronos model prediction (latest data)"
-                
-                # Ensure timestamps are Series format, not DatetimeIndex, to avoid .dt attribute error in Kronos model
-                if isinstance(x_timestamp, pd.DatetimeIndex):
-                    x_timestamp = pd.Series(x_timestamp, name='timestamps')
-                if isinstance(y_timestamp, pd.DatetimeIndex):
-                    y_timestamp = pd.Series(y_timestamp, name='timestamps')
-                
-                pred_df = predictor.predict(
-                    df=x_df,
-                    x_timestamp=x_timestamp,
-                    y_timestamp=y_timestamp,
-                    pred_len=pred_len,
-                    T=temperature,
-                    top_p=top_p,
-                    sample_count=sample_count
-                )
-                
-            except Exception as e:
-                return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
-        else:
-            return jsonify({'error': 'Kronos model not loaded, please load model first'}), 400
-        
-        # Prepare actual data for comparison (if exists)
-        actual_data = []
-        actual_df = None
-        
-        if start_date:  # Custom time period
-            # Fix logic: use data within selected window
-            # Prediction uses first 400 data points within selected window
-            # Actual data should be last 120 data points within selected window
-            start_dt = pd.to_datetime(start_date)
-            
-            # Find data starting from start_date
-            mask = df['timestamps'] >= start_dt
-            time_range_df = df[mask]
-            
-            if len(time_range_df) >= lookback + pred_len:
-                # Get last 120 data points within selected window as actual values
-                actual_df = time_range_df.iloc[lookback:lookback+pred_len]
-                
-                for i, (_, row) in enumerate(actual_df.iterrows()):
-                    actual_data.append({
-                        'timestamp': row['timestamps'].isoformat(),
-                        'open': float(row['open']),
-                        'high': float(row['high']),
-                        'low': float(row['low']),
-                        'close': float(row['close']),
-                        'volume': float(row['volume']) if 'volume' in row else 0,
-                        'amount': float(row['amount']) if 'amount' in row else 0
-                    })
-        else:  # Latest data
-            # Prediction uses first 400 data points
-            # Actual data should be 120 data points after first 400 data points
-            if len(df) >= lookback + pred_len:
-                actual_df = df.iloc[lookback:lookback+pred_len]
-                for i, (_, row) in enumerate(actual_df.iterrows()):
-                    actual_data.append({
-                        'timestamp': row['timestamps'].isoformat(),
-                        'open': float(row['open']),
-                        'high': float(row['high']),
-                        'low': float(row['low']),
-                        'close': float(row['close']),
-                        'volume': float(row['volume']) if 'volume' in row else 0,
-                        'amount': float(row['amount']) if 'amount' in row else 0
-                    })
-        
-        # Create chart - pass historical data start position
-        if start_date:
-            # Custom time period: find starting position of historical data in original df
-            start_dt = pd.to_datetime(start_date)
-            mask = df['timestamps'] >= start_dt
-            historical_start_idx = df[mask].index[0] if len(df[mask]) > 0 else 0
-        else:
-            # Latest data: start from beginning
-            historical_start_idx = 0
-        
-        chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
-        
-        # Prepare prediction result data - fix timestamp calculation logic
-        if 'timestamps' in df.columns:
-            if start_date:
-                # Custom time period: use selected window data to calculate timestamps
-                start_dt = pd.to_datetime(start_date)
-                mask = df['timestamps'] >= start_dt
-                time_range_df = df[mask]
-                
-                if len(time_range_df) >= lookback:
-                    # Calculate prediction timestamps starting from last time point of selected window
-                    last_timestamp = time_range_df['timestamps'].iloc[lookback-1]
-                    time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
-                    future_timestamps = pd.date_range(
-                        start=last_timestamp + time_diff,
-                        periods=pred_len,
-                        freq=time_diff
-                    )
-                else:
-                    future_timestamps = []
+    def top_source_label() -> str:
+        return f"Top {app.config['DASHBOARD_TOP_SYMBOL_LIMIT']}"
+
+    class CoinSessionManager:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._stop_event = threading.Event()
+            self._refresh_event = threading.Event()
+            self._backend_health: dict[str, Any] = {"ok": False, "status": "warming"}
+            self._top_symbols: list[dict[str, Any]] = []
+            self._custom_symbols: list[str] = []
+            self._symbol_meta: dict[str, dict[str, Any]] = {}
+            self._sessions: dict[str, dict[str, Any]] = {}
+            self._selected_top_symbols: set[str] | None = None
+            self._last_error: str | None = None
+            self._last_refreshed_at: str | None = None
+            self._roster_refreshing = False
+            self._prime_roster()
+            threading.Thread(target=self._refresh_loop, daemon=True).start()
+
+        def set_selected_top_symbols(self, symbols: list[str] | None) -> None:
+            if symbols is None:
+                selected: set[str] | None = None
             else:
-                # Latest data: calculate from last time point of entire data file
-                last_timestamp = df['timestamps'].iloc[-1]
-                time_diff = df['timestamps'].iloc[1] - df['timestamps'].iloc[0]
-                future_timestamps = pd.date_range(
-                    start=last_timestamp + time_diff,
-                    periods=pred_len,
-                    freq=time_diff
-                )
-        else:
-            future_timestamps = range(len(df), len(df) + pred_len)
-        
-        prediction_results = []
-        for i, (_, row) in enumerate(pred_df.iterrows()):
-            prediction_results.append({
-                'timestamp': future_timestamps[i].isoformat() if i < len(future_timestamps) else f"T{i}",
-                'open': float(row['open']),
-                'high': float(row['high']),
-                'low': float(row['low']),
-                'close': float(row['close']),
-                'volume': float(row['volume']) if 'volume' in row else 0,
-                'amount': float(row['amount']) if 'amount' in row else 0
-            })
-        
-        # Save prediction results to file
-        try:
-            save_prediction_results(
-                file_path=file_path,
-                prediction_type=prediction_type,
-                prediction_results=prediction_results,
-                actual_data=actual_data,
-                input_data=x_df,
-                prediction_params={
-                    'lookback': lookback,
-                    'pred_len': pred_len,
-                    'temperature': temperature,
-                    'top_p': top_p,
-                    'sample_count': sample_count,
-                    'start_date': start_date if start_date else 'latest'
-                }
-            )
-        except Exception as e:
-            print(f"Failed to save prediction results: {e}")
-        
-        return jsonify({
-            'success': True,
-            'prediction_type': prediction_type,
-            'chart': chart_json,
-            'prediction_results': prediction_results,
-            'actual_data': actual_data,
-            'has_comparison': len(actual_data) > 0,
-            'message': f'Prediction completed, generated {pred_len} prediction points' + (f', including {len(actual_data)} actual data points for comparison' if len(actual_data) > 0 else '')
-        })
-        
-    except Exception as e:
-        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+                selected = set(dedupe_symbols(symbols))
+            with self._lock:
+                self._selected_top_symbols = selected
+            self.request_refresh()
 
-@app.route('/api/load-model', methods=['POST'])
-def load_model():
-    """Load Kronos model"""
-    global tokenizer, model, predictor
-    
-    try:
-        if not MODEL_AVAILABLE:
-            return jsonify({'error': 'Kronos model library not available'}), 400
-        
-        data = request.get_json()
-        model_key = data.get('model_key', 'kronos-small')
-        device = data.get('device', 'cpu')
-        
-        if model_key not in AVAILABLE_MODELS:
-            return jsonify({'error': f'Unsupported model: {model_key}'}), 400
-        
-        model_config = AVAILABLE_MODELS[model_key]
-        
-        # Load tokenizer and model
-        tokenizer = KronosTokenizer.from_pretrained(model_config['tokenizer_id'])
-        model = Kronos.from_pretrained(model_config['model_id'])
-        
-        # Create predictor
-        predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
-        
-        return jsonify({
-            'success': True,
-            'message': f'Model loaded successfully: {model_config["name"]} ({model_config["params"]}) on {device}',
-            'model_info': {
-                'name': model_config['name'],
-                'params': model_config['params'],
-                'context_length': model_config['context_length'],
-                'description': model_config['description']
+        def _sync_session_meta(self, symbol: str, *, source: str, rank: int | None) -> dict[str, Any]:
+            session = self._sessions.setdefault(
+                symbol,
+                {
+                    "data": None,
+                    "refreshing": False,
+                    "last_error": None,
+                    "last_refreshed_at": None,
+                    "cached": False,
+                    "worker_running": False,
+                    "worker_stop": threading.Event(),
+                    "wake_event": threading.Event(),
+                },
+            )
+            session["source"] = source
+            session["rank"] = rank
+            self._symbol_meta[symbol] = {"source": source, "rank": rank}
+            return session
+
+        def _stop_symbol_worker(self, symbol: str) -> None:
+            with self._lock:
+                session = self._sessions.get(symbol)
+                if not session:
+                    return
+                stop_event = session.get("worker_stop")
+                wake_event = session.get("wake_event")
+                session["worker_running"] = False
+            if isinstance(stop_event, threading.Event):
+                stop_event.set()
+            if isinstance(wake_event, threading.Event):
+                wake_event.set()
+
+        def _wake_symbol_worker(self, symbol: str) -> None:
+            with self._lock:
+                session = self._sessions.get(symbol)
+                wake_event = session.get("wake_event") if session else None
+            if isinstance(wake_event, threading.Event):
+                wake_event.set()
+
+        def _fetch_prediction(self, symbol: str) -> dict[str, Any]:
+            response = _backend_request_json(
+                app.config["BACKEND_URL"],
+                "/predict",
+                method="POST",
+                payload={
+                    "symbol": symbol,
+                    "interval": app.config["DASHBOARD_INTERVAL"],
+                    "lookback": app.config["DASHBOARD_LOOKBACK"],
+                    "pred_len": app.config["DASHBOARD_PRED_LEN"],
+                    "sample_count": app.config["DASHBOARD_SAMPLE_COUNT"],
+                    "top_k": app.config["DASHBOARD_TOP_K"],
+                    "top_p": app.config["DASHBOARD_TOP_P"],
+                    "temperature": app.config["DASHBOARD_TEMPERATURE"],
+                    "neutral_threshold_pct": app.config["DASHBOARD_NEUTRAL_THRESHOLD_PCT"],
+                    "confidence_samples": app.config["DASHBOARD_CONFIDENCE_SAMPLES"],
+                },
+            )
+            summary = response.get("summary")
+            if not isinstance(summary, dict):
+                raise ValueError(f"Unexpected prediction response for {symbol}")
+            return {
+                "summary": summary,
+                "model_info": response.get("model_info", {}),
+                "cached": bool(response.get("cached", False)),
             }
-        })
-        
-    except Exception as e:
-        return jsonify({'error': f'Model loading failed: {str(e)}'}), 500
 
-@app.route('/api/available-models')
-def get_available_models():
-    """Get available model list"""
-    return jsonify({
-        'models': AVAILABLE_MODELS,
-        'model_available': MODEL_AVAILABLE
-    })
+        def _refresh_symbol(self, symbol: str) -> None:
+            with self._lock:
+                session = self._sessions.get(symbol)
+                if session is None:
+                    return
+                meta = {"source": session.get("source", top_source_label()), "rank": session.get("rank")}
 
-@app.route('/api/model-status')
-def get_model_status():
-    """Get model status"""
-    if MODEL_AVAILABLE:
-        if predictor is not None:
-            return jsonify({
-                'available': True,
-                'loaded': True,
-                'message': 'Kronos model loaded and available',
-                'current_model': {
-                    'name': predictor.model.__class__.__name__,
-                    'device': str(next(predictor.model.parameters()).device)
+            try:
+                prediction = self._fetch_prediction(symbol)
+                row = dashboard_row_from_summary(symbol, prediction["summary"], source=meta["source"], rank=meta["rank"])
+                row["ready"] = True
+                row["cached"] = prediction["cached"]
+                row["refreshing"] = False
+                row["status"] = "ready"
+                with self._lock:
+                    session = self._sessions.setdefault(symbol, {})
+                    session["data"] = row
+                    session["last_error"] = None
+                    session["last_refreshed_at"] = _utc_timestamp()
+                    session["cached"] = prediction["cached"]
+                    session["refreshing"] = False
+                    session["model_info"] = prediction["model_info"]
+                    self._last_refreshed_at = session["last_refreshed_at"]
+            except Exception as exc:
+                with self._lock:
+                    session = self._sessions.setdefault(symbol, {})
+                    session["last_error"] = str(exc)
+                    session["refreshing"] = False
+                    self._last_error = str(exc)
+
+        def _symbol_worker(self, symbol: str) -> None:
+            while not self._stop_event.is_set():
+                with self._lock:
+                    session = self._sessions.get(symbol)
+                    if session is None:
+                        return
+                    stop_event = session.get("worker_stop")
+                    wake_event = session.get("wake_event")
+                    session["worker_running"] = True
+                    session["refreshing"] = True
+                if isinstance(stop_event, threading.Event) and stop_event.is_set():
+                    break
+
+                self._refresh_symbol(symbol)
+
+                with self._lock:
+                    session = self._sessions.get(symbol)
+                    if session is None:
+                        return
+                    session["refreshing"] = False
+
+                interval_seconds = max(1, int(app.config["DASHBOARD_REFRESH_SECONDS"]))
+                if isinstance(wake_event, threading.Event) and wake_event.wait(interval_seconds):
+                    wake_event.clear()
+                if isinstance(stop_event, threading.Event) and stop_event.is_set():
+                    break
+
+            with self._lock:
+                session = self._sessions.get(symbol)
+                if session is not None:
+                    session["worker_running"] = False
+
+        def _ensure_symbol_worker(self, symbol: str) -> None:
+            with self._lock:
+                session = self._sessions.get(symbol)
+                if session is None:
+                    return
+                if session.get("worker_running"):
+                    return
+                session["worker_running"] = True
+                session["worker_stop"] = threading.Event()
+                session["wake_event"] = threading.Event()
+            threading.Thread(target=self._symbol_worker, args=(symbol,), daemon=True).start()
+
+        def _refresh_roster(self) -> None:
+            with self._lock:
+                if self._roster_refreshing:
+                    return
+                self._roster_refreshing = True
+
+            try:
+                backend_health = get_backend_health()
+                top_items = get_top_symbols()
+                custom_symbols = _load_custom_symbols(watchlist_store)
+                top_symbols = [normalize_symbol(item.get("symbol")) for item in top_items]
+                selected_top_symbols = self._selected_top_symbols
+                if selected_top_symbols is None:
+                    active_top_items = [dict(item, selected=True) for item in top_items]
+                    active_top_symbols = top_symbols
+                else:
+                    active_top_items = []
+                    active_top_symbols = []
+                    for item in top_items:
+                        symbol = normalize_symbol(item.get("symbol"))
+                        selected = symbol in selected_top_symbols
+                        annotated = dict(item)
+                        annotated["selected"] = selected
+                        active_top_items.append(annotated)
+                        if selected:
+                            active_top_symbols.append(symbol)
+
+                merged_symbols = merge_symbol_lists(active_top_symbols, custom_symbols)
+
+                with self._lock:
+                    self._backend_health = backend_health
+                    self._top_symbols = active_top_items
+                    self._custom_symbols = custom_symbols
+                    self._symbol_meta = {}
+                    for item in active_top_items:
+                        symbol = normalize_symbol(item.get("symbol"))
+                        if not symbol:
+                            continue
+                        if item.get("selected"):
+                            self._sync_session_meta(symbol, source=top_source_label(), rank=int(item.get("rank", 0) or 0) or None)
+                        else:
+                            self._symbol_meta[symbol] = {"source": top_source_label(), "rank": int(item.get("rank", 0) or 0) or None}
+                    for symbol in custom_symbols:
+                        if symbol in self._symbol_meta:
+                            continue
+                        self._sync_session_meta(symbol, source="Custom", rank=None)
+                    for symbol in merged_symbols:
+                        self._sessions.setdefault(
+                            symbol,
+                            {
+                                "data": None,
+                                "refreshing": False,
+                                "last_error": None,
+                                "last_refreshed_at": None,
+                                "cached": False,
+                                "worker_running": False,
+                                "worker_stop": threading.Event(),
+                                "wake_event": threading.Event(),
+                                "source": self._symbol_meta.get(symbol, {}).get("source", top_source_label()),
+                                "rank": self._symbol_meta.get(symbol, {}).get("rank"),
+                            },
+                        )
+                    stale_symbols = [symbol for symbol in list(self._sessions.keys()) if symbol not in merged_symbols]
+                    self._last_error = None
+                    self._last_refreshed_at = _utc_timestamp()
+                    schedule_symbols = list(merged_symbols)
+            except Exception as exc:
+                with self._lock:
+                    self._last_error = str(exc)
+                    self._backend_health = {"ok": False, "status": "warning", "error": str(exc)}
+                    schedule_symbols = []
+                    stale_symbols = []
+            finally:
+                with self._lock:
+                    self._roster_refreshing = False
+
+            for symbol in stale_symbols:
+                self._stop_symbol_worker(symbol)
+                with self._lock:
+                    self._sessions.pop(symbol, None)
+                    self._symbol_meta.pop(symbol, None)
+
+            for symbol in schedule_symbols:
+                self._ensure_symbol_worker(symbol)
+
+        def _prime_roster(self) -> None:
+            self._refresh_roster()
+
+        def request_refresh(self) -> None:
+            self._refresh_event.set()
+            threading.Thread(target=self._refresh_roster, daemon=True).start()
+
+        def _refresh_loop(self) -> None:
+            while not self._stop_event.is_set():
+                self._refresh_roster()
+                if self._refresh_event.wait(app.config["DASHBOARD_REFRESH_SECONDS"]):
+                    self._refresh_event.clear()
+                if self._stop_event.is_set():
+                    break
+
+        def snapshot(self) -> dict[str, Any]:
+            with self._lock:
+                top_symbols = [dict(item) for item in self._top_symbols]
+                custom_symbols = list(self._custom_symbols)
+                active_top_symbols = [normalize_symbol(item.get("symbol")) for item in top_symbols if item.get("selected", True)]
+                symbols = merge_symbol_lists(active_top_symbols, custom_symbols)
+                items: list[dict[str, Any]] = []
+                for symbol in symbols:
+                    meta = self._symbol_meta.get(symbol, {"source": top_source_label(), "rank": None})
+                    session = self._sessions.get(symbol)
+                    if session and session.get("data"):
+                        row = dict(session["data"])
+                        row["refreshing"] = bool(session.get("refreshing"))
+                        row["last_error"] = session.get("last_error")
+                    else:
+                        row = dashboard_placeholder_row(symbol, source=str(meta.get("source", top_source_label())), rank=meta.get("rank"))
+                        row["refreshing"] = bool(session.get("refreshing")) if session else False
+                        row["last_error"] = session.get("last_error") if session else None
+                    items.append(row)
+
+                ready_rows = [item for item in items if item.get("ready")]
+                cached = any(bool(item.get("cached")) for item in ready_rows)
+                last_refreshed_candidates = [
+                    str(session.get("last_refreshed_at"))
+                    for session in self._sessions.values()
+                    if session.get("last_refreshed_at")
+                ]
+                last_refreshed_candidates.append(self._last_refreshed_at or "")
+                last_refreshed_at = max((value for value in last_refreshed_candidates if value), default=None)
+                refreshing = self._roster_refreshing or any(bool(session.get("refreshing")) for session in self._sessions.values())
+                payload = {
+                    "generated_at": _utc_timestamp(),
+                    "backend": dict(self._backend_health),
+                    "top_symbols": top_symbols,
+                    "custom_symbols": custom_symbols,
+                    "symbols": symbols,
+                    "items": items,
+                    "selected_top_symbols": active_top_symbols,
+                    "model_info": next((dict(session.get("model_info", {})) for session in self._sessions.values() if session.get("model_info")), {}),
+                    "cached": cached,
+                    "refresh_seconds": app.config["DASHBOARD_REFRESH_SECONDS"],
+                    "interval": app.config["DASHBOARD_INTERVAL"],
+                    "lookback": app.config["DASHBOARD_LOOKBACK"],
+                    "pred_len": app.config["DASHBOARD_PRED_LEN"],
+                    "refreshing": refreshing,
+                    "last_error": self._last_error,
+                    "last_refreshed_at": last_refreshed_at,
                 }
-            })
-        else:
-            return jsonify({
-                'available': True,
-                'loaded': False,
-                'message': 'Kronos model available but not loaded'
-            })
-    else:
-        return jsonify({
-            'available': False,
-            'loaded': False,
-            'message': 'Kronos model library not available, please install related dependencies'
-        })
+                return payload
 
-if __name__ == '__main__':
-    print("Starting Kronos Web UI...")
-    print(f"Model availability: {MODEL_AVAILABLE}")
-    if MODEL_AVAILABLE:
-        print("Tip: You can load Kronos model through /api/load-model endpoint")
-    else:
-        print("Tip: Will use simulated data for demonstration")
-    
-    app.run(debug=True, host='0.0.0.0', port=7070)
+    dashboard_manager: CoinSessionManager | None = None
+    if app.config["DASHBOARD_BACKGROUND_REFRESH"]:
+        dashboard_manager = CoinSessionManager()
+        app.extensions["dashboard_manager"] = dashboard_manager
+
+    def refresh_snapshot() -> None:
+        try:
+            payload = build_dashboard_payload()
+            with snapshot_lock:
+                snapshot_state["data"] = payload
+                snapshot_state["last_error"] = None
+                snapshot_state["last_refreshed_at"] = payload["generated_at"]
+        except Exception as exc:
+            with snapshot_lock:
+                snapshot_state["last_error"] = str(exc)
+        finally:
+            with snapshot_lock:
+                snapshot_state["refreshing"] = False
+
+    def trigger_refresh() -> bool:
+        with snapshot_lock:
+            if snapshot_state["refreshing"]:
+                return False
+            snapshot_state["refreshing"] = True
+
+        threading.Thread(target=refresh_snapshot, daemon=True).start()
+        return True
+
+    def refresh_loop() -> None:
+        trigger_refresh()
+        while not stop_event.is_set():
+            refresh_event.wait(app.config["DASHBOARD_REFRESH_SECONDS"])
+            refresh_event.clear()
+            if stop_event.is_set():
+                break
+            trigger_refresh()
+
+    if app.config["DASHBOARD_BACKGROUND_REFRESH"] and dashboard_manager is None:
+        threading.Thread(target=refresh_loop, daemon=True).start()
+
+    @app.route("/")
+    def index() -> str:
+        if dashboard_manager is not None:
+            initial_dashboard = dashboard_manager.snapshot()
+        else:
+            with snapshot_lock:
+                initial_dashboard = dict(snapshot_state["data"] or build_placeholder_payload())
+                initial_dashboard["refreshing"] = bool(snapshot_state["refreshing"])
+                initial_dashboard["last_error"] = snapshot_state["last_error"]
+                initial_dashboard["last_refreshed_at"] = snapshot_state["last_refreshed_at"]
+        initial_dashboard.setdefault("selected_top_symbols", initial_dashboard.get("selected_top_symbols", []))
+        return render_template(
+            "index.html",
+            backend_url=app.config["BACKEND_URL"],
+            refresh_seconds=app.config["DASHBOARD_REFRESH_SECONDS"],
+            interval=app.config["DASHBOARD_INTERVAL"],
+            watchlist_limit=app.config["DASHBOARD_TOP_SYMBOL_LIMIT"],
+            top_source_label=top_source_label(),
+            initial_dashboard=initial_dashboard,
+        )
+
+    @app.route("/api/health")
+    def health() -> Any:
+        try:
+            if dashboard_manager is not None:
+                backend = dashboard_manager.snapshot()["backend"]
+            else:
+                backend = get_backend_health()
+            return jsonify(
+                {
+                    "ok": True,
+                    "backend": backend,
+                    "refresh_seconds": app.config["DASHBOARD_REFRESH_SECONDS"],
+                }
+            )
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 503
+
+    @app.route("/api/watchlist", methods=["GET", "POST"])
+    def watchlist() -> Any:
+        if request.method == "GET":
+            return jsonify({"symbols": _load_custom_symbols(watchlist_store)})
+
+        payload = request.get_json(silent=True) or {}
+        raw_symbols = payload.get("symbols")
+        if isinstance(raw_symbols, list) and raw_symbols:
+            updated = watchlist_store.load()
+            for raw_symbol in raw_symbols:
+                updated = watchlist_store.add(raw_symbol)
+            return jsonify({"symbols": updated})
+
+        symbol = payload.get("symbol")
+        if not symbol:
+            return jsonify({"error": "symbol is required"}), 400
+
+        try:
+            validated = validate_usdt_symbol(symbol)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        updated = watchlist_store.add(validated)
+        if dashboard_manager is not None:
+            dashboard_manager.request_refresh()
+        else:
+            refresh_event.set()
+            trigger_refresh()
+        return jsonify({"symbols": updated, "symbol": validated})
+
+    @app.route("/api/watchlist/<symbol>", methods=["DELETE"])
+    def delete_watchlist_symbol(symbol: str) -> Any:
+        try:
+            validated = validate_usdt_symbol(symbol)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        updated = watchlist_store.remove(validated)
+        if dashboard_manager is not None:
+            dashboard_manager.request_refresh()
+        else:
+            refresh_event.set()
+            trigger_refresh()
+        return jsonify({"symbols": updated, "removed": validated})
+
+    @app.route("/api/top-symbols")
+    def top_symbols() -> Any:
+        try:
+            if dashboard_manager is not None:
+                return jsonify({"items": dashboard_manager.snapshot()["top_symbols"]})
+            return jsonify({"items": get_top_symbols()})
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 503
+
+    @app.route("/api/dashboard")
+    def dashboard() -> Any:
+        try:
+            selected_top_symbols_raw = request.args.get("selected_top_symbols")
+            selected_top_symbols = None
+            if selected_top_symbols_raw is not None:
+                selected_top_symbols = dedupe_symbols(
+                    [symbol for symbol in selected_top_symbols_raw.split(",") if symbol.strip()]
+                )
+                if dashboard_manager is not None:
+                    dashboard_manager.set_selected_top_symbols(selected_top_symbols)
+            elif dashboard_manager is not None:
+                selected_top_symbols = None
+            if dashboard_manager is not None:
+                payload = dashboard_manager.snapshot()
+                if selected_top_symbols is not None:
+                    payload["selected_top_symbols"] = selected_top_symbols
+                return jsonify(payload)
+            with snapshot_lock:
+                data_payload = dict(snapshot_state["data"] or {})
+                refreshing = bool(snapshot_state["refreshing"])
+                last_error = snapshot_state["last_error"]
+                last_refreshed_at = snapshot_state["last_refreshed_at"]
+            if not data_payload and not app.config["DASHBOARD_BACKGROUND_REFRESH"]:
+                data_payload = build_dashboard_payload(selected_top_symbols)
+                with snapshot_lock:
+                    snapshot_state["data"] = data_payload
+                    snapshot_state["last_error"] = None
+                    snapshot_state["last_refreshed_at"] = data_payload["generated_at"]
+                refreshing = False
+                last_error = None
+                last_refreshed_at = data_payload["generated_at"]
+            if not data_payload:
+                trigger_refresh()
+                placeholder = build_placeholder_payload()
+                placeholder["refreshing"] = True
+                placeholder["last_error"] = last_error
+                placeholder["last_refreshed_at"] = last_refreshed_at
+                return jsonify(placeholder)
+            payload = dict(data_payload)
+            payload["refreshing"] = refreshing
+            payload["last_error"] = last_error
+            payload["last_refreshed_at"] = last_refreshed_at
+            return jsonify(payload)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 503
+
+    return app
+
+
+app = create_app()
+
+
+if __name__ == "__main__":
+    port = _env_int("PORT", 7070)
+    app.run(host="0.0.0.0", port=port, debug=False)

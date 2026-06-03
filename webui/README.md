@@ -1,16 +1,14 @@
-# Kronos Web UI
+# Kronos Crypto Dashboard
 
-Web user interface for Kronos financial prediction model, providing intuitive graphical operation interface.
+Lightweight Flask dashboard for the warm Kronos prediction API. It shows the daily Binance top 30 USDT coins, lets you add extra coins, and refreshes live signals every 10 seconds.
 
 ## ✨ Features
 
-- **Multi-format data support**: Supports CSV, Feather and other financial data formats
-- **Smart time window**: Fixed 400+120 data point time window slider selection
-- **Real model prediction**: Integrated real Kronos model, supports multiple model sizes
-- **Prediction quality control**: Adjustable temperature, nucleus sampling, sample count and other parameters
-- **Multi-device support**: Supports CPU, CUDA, MPS and other computing devices
-- **Comparison analysis**: Detailed comparison between prediction results and actual data
-- **K-line chart display**: Professional financial K-line chart display
+- **Top 30 USDT pairs**: Ranked by Binance 24h quote volume
+- **Custom coins**: Persisted in a mounted JSON volume
+- **Warm backend**: The model is loaded once in the predictor container
+- **10-second refresh**: Frontend auto-refreshes the table and chips
+- **Focused fields**: Only shows the fields needed for trading review
 
 ## 🚀 Quick Start
 
@@ -33,52 +31,43 @@ cd webui
 python app.py
 ```
 
-After successful startup, visit http://localhost:7070
+After successful startup, visit `http://localhost:7070`
+
+### Method 4: Full Docker stack
+
+```bash
+docker compose up --build
+```
 
 ## 📋 Usage Steps
 
-1. **Load data**: Select financial data file from data directory
-2. **Load model**: Select Kronos model and computing device
-3. **Set parameters**: Adjust prediction quality parameters
-4. **Select time window**: Use slider to select 400+120 data point time range
-5. **Start prediction**: Click prediction button to generate results
-6. **View results**: View prediction results in charts and tables
+1. **Start the stack**: Run Docker Compose or launch the backend and frontend separately
+2. **Review the top 30**: The dashboard pulls the daily Binance ranking automatically
+3. **Add custom coins**: Enter an extra `USDT` pair in the form and save it
+4. **Refresh live**: The table updates every 10 seconds
 
 ## 🔧 Prediction Quality Parameters
 
-### Temperature (T)
-- **Range**: 0.1 - 2.0
-- **Effect**: Controls prediction randomness
-- **Recommendation**: 1.2-1.5 for better prediction quality
+### Environment Variables
 
-### Nucleus Sampling (top_p)
-- **Range**: 0.1 - 1.0
-- **Effect**: Controls prediction diversity
-- **Recommendation**: 0.95-1.0 to consider more possibilities
-
-### Sample Count
-- **Range**: 1 - 5
-- **Effect**: Generate multiple prediction samples
-- **Recommendation**: 2-3 samples to improve quality
+- `KRONOS_BACKEND_URL`: URL of the warm predictor service
+- `DASHBOARD_WATCHLIST_PATH`: Path to the persisted custom coin registry
+- `DASHBOARD_REFRESH_SECONDS`: Auto-refresh interval
+- `DASHBOARD_INTERVAL`: Candle interval sent to the backend
+- `DASHBOARD_LOOKBACK`: Number of historical candles used for context
+- `DASHBOARD_PRED_LEN`: Prediction horizon
+- `DASHBOARD_SAMPLE_COUNT`: Sampling count for the backend model
+- `DASHBOARD_CONFIDENCE_SAMPLES`: Direction agreement sampling count
 
 ## 📊 Supported Data Formats
 
-### Required Columns
-- `open`: Opening price
-- `high`: Highest price
-- `low`: Lowest price
-- `close`: Closing price
-
-### Optional Columns
-- `volume`: Trading volume
-- `amount`: Trading amount (not used for prediction)
-- `timestamps`/`timestamp`/`date`: Timestamp
+### Required Symbols
+- Use Binance-style `USDT` pairs such as `BTCUSDT`
 
 ## 🤖 Model Support
 
-- **Kronos-mini**: 4.1M parameters, lightweight fast prediction
 - **Kronos-small**: 24.7M parameters, balanced performance and speed
-- **Kronos-base**: 102.3M parameters, high quality prediction
+- **Kronos-base**: 102.3M parameters, higher quality prediction
 
 ## 🖥️ GPU Acceleration Support
 
@@ -88,10 +77,9 @@ After successful startup, visit http://localhost:7070
 
 ## ⚠️ Notes
 
-- `amount` column is not used for prediction, only for display
-- Time window is fixed at 400+120=520 data points
-- Ensure data file contains sufficient historical data
-- First model loading may require download, please be patient
+- The dashboard expects `USDT` pairs
+- The custom coin registry is persisted in a mounted volume when using Docker
+- The first model load may take a while while weights are downloaded
 
 ## 🔍 Comparison Analysis
 
